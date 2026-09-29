@@ -6,6 +6,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Primary LLM (tried first). Optional: without a key, Gemini is used directly.
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+# Must accept images (gpt-oss models do not).
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
+
+# Fallback LLM (used when the primary fails).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 # Vision OCR model (required); must accept images.
