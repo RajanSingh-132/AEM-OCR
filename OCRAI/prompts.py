@@ -15,25 +15,51 @@ OCR_INSTRUCTION = (
 # Marker the OCR model replies with when an image has no text.
 NO_TEXT_MARKER = "NO_TEXT_FOUND"
 
-# ---------------------------------------------------------------------------
-# TEMPORARY PLACEHOLDER - replace the whole string below with PRD Appendix A,
-# verbatim. Keep the single {text} placeholder where the document text goes.
-# ---------------------------------------------------------------------------
-EXTRACTION_PROMPT = """You extract order data from a logistics document.
-Return ONLY one JSON object with exactly these top-level keys: "customerinfo", "shipment", "Revenue".
-Use null for any value that is not in the document. Never invent values.
+EXTRACTION_PROMPT = """You convert a business document into JSON that captures ALL of its data.
 
-"shipment" is one object for a single line item, or an array of objects for 2+ line items.
-Each shipment object has exactly these keys (every value a string or null):
-commodity, pickup_location, pickup_date, pickup_time, pickup_refrence_no, distance,
-delivery_location, delivery_date, delivery_time, delivery_refrence_no, ValueOfgoods,
-Equipment, No.OfPackage, weight, temperature, dimention, pickupNote, DeliveryNotes,
-Copmliancehandling
-"commodity" is the description of the goods, never a package count or a weight.
+## How the input is built
+The DOCUMENT TEXT below was extracted automatically, page by page. Besides the printed text,
+it can contain sections added by the extractor. They are part of the document:
+- "=== FILLED-IN VALUES (label: value, same row) ===": values typed onto the page (e.g. a
+  filled-in form). Each line is "<label printed on the same row> <typed value>". If a line has
+  no label, use the surrounding printed text and the value itself to decide what it is.
+- "=== PDF FORM FIELD VALUES ===": fillable form fields as "<internal field name>: <value>".
+  Field names are technical; match them to the printed labels by meaning.
+- "=== EMBEDDED IMAGE OCR ===" and "=== PAGE RENDER OCR ===": text read from images or from
+  the rendered page. It may repeat printed text and may contain small OCR errors.
 
-"customerinfo" holds the customer's details and "Revenue" the charges, including
-"fluecurrencyTypes": a list of fuel lines with keys fuelratemethod, fuel_rate_method_value,
-fuel_total_value.
+## The most important rule: labels and values
+Forms often print a label with an EMPTY space next to it ("Driver Name:" followed by nothing)
+and store the value elsewhere. Before you set any field to null, look for its value in ALL
+sections above. Use null ONLY when the value truly appears nowhere in the input.
+
+## Output
+Return ONLY one JSON object, no markdown, no explanations. Build the structure from the
+document itself:
+1. "document_type": what the document is (e.g. "Bill of Lading", "Rate Confirmation",
+   "ACE eManifest"), as named in the document or inferred from its content.
+2. Capture EVERY piece of data: reference and ID numbers, dates, times, parties, addresses,
+   contacts, phone and fax numbers, emails, vehicles and plates, line items, quantities,
+   weights, dimensions, charges, totals, currencies, instructions, notes, terms, signatures.
+3. Keys: named after the document's own labels, in snake_case ("BOL #" -> "bol_number",
+   "Truck License Plate" -> "truck_license_plate").
+4. Nesting: group related fields the way the document groups them ("shipper", "consignee",
+   "carrier", "driver", "pickup", "delivery", "charges"). Repeating sections (stops, items,
+   charges) become arrays.
+5. Tables: an array of objects, one object per row, keys from the column headers.
+   Include ONLY rows that contain at least one value; skip blank rows. A table with no filled
+   rows becomes an empty array [].
+6. Letterheads, logos and footers of the company that printed or supplies the blank form
+   (its name, phone, fax, website) go into a separate "form_provider" object. Never use them
+   as the value of a field in the document body. For example, a "Company Name:" field gets
+   the value written for it, not the name printed in the letterhead.
+7. Values: copy exactly as written, keeping dates, units, currency symbols and leading zeros.
+   Use JSON numbers only for plain amounts or counts without units. Each fact appears once:
+   do not duplicate the same value under several keys, and merge a title that the text
+   repeats ("MANIFESTMANIFEST") into one.
+8. Never invent data or add anything that is not in the input. Correct obvious OCR mistakes
+   only when certain.
+9. Long free text (terms and conditions, legal notices) goes in full under a descriptive key.
 
 DOCUMENT TEXT:
 {text}

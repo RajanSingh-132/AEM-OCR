@@ -24,6 +24,7 @@ MIN_CARVED_JPEG_BYTES = 10_000  # smaller JPEG chunks are icons, not photos
 RENDER_SCALE = 2.08          # ~150 DPI
 CHECKBOX_VALUES = {"", "Off", "Yes", "No"}  # compared without the leading "/"
 CHECKBOX_SUFFIXES = ("check", "chk", "box", "flag")
+ANNOTATION_ROW_TOLERANCE = 6  # points; a label this close vertically is on the same row
 
 
 def real_words(text: str) -> list[str]:
@@ -67,6 +68,68 @@ def form_field_lines(reader: PdfReader) -> list[str]:
         if lowered.endswith("label") and value.endswith(":"):
             continue
         lines.append(f"{name}: {value}")
+    return lines
+
+
+def _text_fragments(page) -> list[tuple[float, float, str]]:
+    """Text-layer fragments as (x, y, text) in page coordinates."""
+    fragments = []
+
+    def visit(text, cm, tm, font_dict, font_size):
+        if text.strip():
+            x = cm[0] * tm[4] + cm[2] * tm[5] + cm[4]
+            y = cm[1] * tm[4] + cm[3] * tm[5] + cm[5]
+            fragments.append((x, y, text.strip()))
+
+    page.extract_text(visitor_text=visit)
+    return fragments
+
+
+def _annotation_value(annot) -> str:
+    """Visible text typed onto the page: FreeText boxes and text form widgets."""
+    subtype = annot.get("/Subtype")
+    if subtype == "/FreeText":
+        return str(annot.get("/Contents") or "").strip()
+    if subtype == "/Widget":
+        parent = annot.get("/Parent")
+        parent = parent.get_object() if parent is not None else {}
+        field_type = annot.get("/FT") or parent.get("/FT")
+        value = annot.get("/V") if annot.get("/V") is not None else parent.get("/V")
+        if field_type in ("/Tx", "/Ch") and value is not None:
+            return str(value.get_object() if hasattr(value, "get_object") else value).strip()
+    return ""
+
+
+def annotation_lines(page) -> list[str]:
+    """Values typed onto the page as annotations, each prefixed with the label on the same row.
+
+    Many forms are filled in with "Add Text" tools: the values then live in annotations,
+    not in the text layer, so the text layer alone shows only empty labels.
+    """
+    annots = []
+    for ref in page.get("/Annots") or []:
+        annot = ref.get_object()
+        value = _annotation_value(annot)
+        rect = annot.get("/Rect")
+        if value and rect:
+            x1, y1, x2, y2 = (float(v) for v in rect)
+            annots.append((min(x1, x2), min(y1, y2), max(y1, y2), value))
+    if not annots:
+        return []
+
+    fragments = sorted(_text_fragments(page))  # left to right
+    lines = []
+    for left, bottom, top, value in sorted(annots, key=lambda a: (-a[2], a[0])):  # top to bottom
+        candidates = [
+            (x, y, text) for x, y, text in fragments
+            if bottom - ANNOTATION_ROW_TOLERANCE <= y <= top + ANNOTATION_ROW_TOLERANCE and x < left
+        ]
+        label = ""
+        if candidates:
+            # A tall box can overlap the line above: keep only the row nearest the text baseline.
+            row_y = min((y for _, y, _ in candidates), key=lambda y: abs(y - bottom))
+            label = " ".join(text for _, y, text in candidates if abs(y - row_y) <= 2)
+        lines.append(f"{label} {value}" if label else value)
     return lines
 
 
@@ -139,12 +202,21 @@ def load_pdf(data: bytes, filename: str) -> list[str]:
         reader.decrypt("")
 
     pages = []
-    for page in reader.pages:
+    for number, page in enumerate(reader.pages, start=1):
         try:
-            pages.append(page.extract_text() or "")
+            text = page.extract_text() or ""
         except Exception:
-            log.exception("  Could not read the text layer of a page")
-            pages.append("")
+            log.exception("  Could not read the text layer of page %d", number)
+            text = ""
+        try:
+            lines = annotation_lines(page)
+        except Exception:
+            log.exception("  Could not read annotations on page %d", number)
+            lines = []
+        if lines:
+            text = text.rstrip() + "\n\n=== FILLED-IN VALUES (label: value, same row) ===\n" + "\n".join(lines)
+            log.info("  Page %d: %d typed-in value(s) found in annotations", number, len(lines))
+        pages.append(text)
     log.info("  PDF: %d page(s), Tier 1 text layer %d chars total", len(pages), sum(len(p) for p in pages))
 
     state = _PdfOcr(data, filename)

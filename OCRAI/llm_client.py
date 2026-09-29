@@ -28,7 +28,18 @@ if not GEMINI_VISION_MODEL:
         "GEMINI_VISION_MODEL is missing. Add it to the .env file, e.g. GEMINI_VISION_MODEL=gemini-2.5-flash"
     )
 
-_client = genai.Client(api_key=GEMINI_API_KEY)
+# Retry temporary failures (503 overloaded, 429 rate limit, 5xx) with growing waits: 2s, 4s, 8s, 16s.
+_client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(
+        retry_options=types.HttpRetryOptions(
+            attempts=5,
+            initial_delay=2,
+            max_delay=30,
+            http_status_codes=[408, 429, 500, 502, 503, 504],
+        )
+    ),
+)
 
 
 class LLMError(RuntimeError):

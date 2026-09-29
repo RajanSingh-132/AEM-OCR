@@ -1,4 +1,4 @@
-"""The extraction pipeline (PRD 5.5): file -> page texts -> LLM -> normalized JSON.
+"""The extraction pipeline (PRD 5.5): file -> page texts -> LLM -> JSON that mirrors the document.
 
 Never raises: any failure becomes {"error": "<message>"}.
 """

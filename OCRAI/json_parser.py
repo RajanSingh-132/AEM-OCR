@@ -1,11 +1,7 @@
-"""Robust parsing of the LLM's reply into JSON (PRD 5.6)."""
+"""Robust parsing of the LLM's reply into JSON (PRD 5.6). The structure is kept as-is."""
 
 import json
 import re
-
-from OCRAI.normalize import normalize_extract
-
-EXTRACT_KEYS = {"customerinfo", "shipment", "Revenue", "raw_extracted_text", "error"}
 
 
 def _try_load(text: str):
@@ -38,14 +34,13 @@ def parse_llm_json(text: str) -> dict | list:
     for candidate in candidates:
         value = _try_load(candidate)
         if isinstance(value, dict):
-            return normalize_extract(value)
+            return value
 
+    # A list of objects is kept; a bare scalar array (e.g. ["0.000","0.000"]) never is.
     first, last = cleaned.find("["), cleaned.rfind("]")
     if first != -1 and last > first:
         value = _try_load(cleaned[first:last + 1])
         if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
-            if any(EXTRACT_KEYS & item.keys() for item in value):
-                return [normalize_extract(item) for item in value]
             return value
 
     objects = []
@@ -54,7 +49,7 @@ def parse_llm_json(text: str) -> dict | list:
         if line.startswith("{"):
             value = _try_load(line.rstrip(","))
             if isinstance(value, dict):
-                objects.append(normalize_extract(value))
+                objects.append(value)
     if len(objects) == 1:
         return objects[0]
     if objects:

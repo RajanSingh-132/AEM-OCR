@@ -43,7 +43,7 @@ def validate_upload(filename: str, content_type: str | None) -> None:
 
 @router.post("/upload/pdf_dynamic_extract")
 async def pdf_dynamic_extract(file: UploadFile = File(...)):
-    """Extract order data (customer info, shipments, revenue) from a PDF, image or Word file."""
+    """Extract all details of a PDF, image or Word file as JSON that mirrors the document's structure."""
     request_start = time.perf_counter()
     filename = file.filename or ""
     log.info("=" * 70)
@@ -67,6 +67,3 @@ async def pdf_dynamic_extract(file: UploadFile = File(...)):
         log.info("=" * 70)
 
 
-@router.get("/health")
-async def health():
-    return {"status": "ok"}
