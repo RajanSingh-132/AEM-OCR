@@ -1,28 +1,40 @@
-"""All prompts sent to Gemini. Edit the wording here; no other file needs to change.
+"""All prompts sent to the LLM. Edit the wording here; no other file needs to change.
 
-How they are combined for every /extract request (see OCRAI/gemini.py):
+Never name an LLM vendor in these prompts.
 
-    system_instruction = SYSTEM_INSTRUCTION           (fixed rules, same for every request)
-    contents           = "INSTRUCTIONS:\n" + <user prompt or DEFAULT_PROMPT>
-                         + "\n\nDOCUMENT:\n" + <extracted text, page by page>
+EXTRACTION_PROMPT is filled with str.replace("{text}", ...), not str.format, so the
+literal braces in its JSON examples do NOT need to be doubled.
 """
 
-# Fixed rules Gemini must always follow, whatever the user asks.
-# Sent as the system instruction, so it takes priority over the user prompt
-# and over any text inside the document itself.
-SYSTEM_INSTRUCTION = """You are a document data-extraction engine.
-You receive the full text of a document (extracted page by page, some pages via OCR)
-and the user's extraction instructions.
-Rules:
-- Return ONLY valid JSON. No markdown, no explanations.
-- Follow the user's instructions / requested JSON structure exactly when given.
-- Use null for values that are not present in the document. Never invent data.
-- Keep numbers as numbers and dates as they appear unless told otherwise.
-- OCR text may contain small errors; correct obvious OCR mistakes only when certain."""
-
-# Used when the caller leaves the `prompt` form field empty on POST /extract.
-# The caller's own prompt replaces this completely (it is not appended).
-DEFAULT_PROMPT = (
-    "Extract all meaningful structured information from this document "
-    "(document type, parties, dates, IDs, amounts, tables, line items, etc.)."
+# Vision OCR (PRD 5.1): sent together with one image.
+OCR_INSTRUCTION = (
+    "Extract readable text from this image exactly as present. "
+    "If the image has no readable text, reply with: NO_TEXT_FOUND"
 )
+
+# Marker the OCR model replies with when an image has no text.
+NO_TEXT_MARKER = "NO_TEXT_FOUND"
+
+# ---------------------------------------------------------------------------
+# TEMPORARY PLACEHOLDER - replace the whole string below with PRD Appendix A,
+# verbatim. Keep the single {text} placeholder where the document text goes.
+# ---------------------------------------------------------------------------
+EXTRACTION_PROMPT = """You extract order data from a logistics document.
+Return ONLY one JSON object with exactly these top-level keys: "customerinfo", "shipment", "Revenue".
+Use null for any value that is not in the document. Never invent values.
+
+"shipment" is one object for a single line item, or an array of objects for 2+ line items.
+Each shipment object has exactly these keys (every value a string or null):
+commodity, pickup_location, pickup_date, pickup_time, pickup_refrence_no, distance,
+delivery_location, delivery_date, delivery_time, delivery_refrence_no, ValueOfgoods,
+Equipment, No.OfPackage, weight, temperature, dimention, pickupNote, DeliveryNotes,
+Copmliancehandling
+"commodity" is the description of the goods, never a package count or a weight.
+
+"customerinfo" holds the customer's details and "Revenue" the charges, including
+"fluecurrencyTypes": a list of fuel lines with keys fuelratemethod, fuel_rate_method_value,
+fuel_total_value.
+
+DOCUMENT TEXT:
+{text}
+"""
