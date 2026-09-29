@@ -1,21 +1,29 @@
-"""The LLM (Gemini) used for vision OCR and structured extraction.
+"""The LLMs used for vision OCR and structured extraction: Groq first, Gemini as fallback.
 
-The client is created once at import. Calls are synchronous because the pipeline
-runs in a worker thread. Errors are re-raised as LLMError with a vendor-neutral
-message; the full error is only written to the server log.
+Every call goes to the primary (Groq) once; if that fails, it goes to the fallback (Gemini)
+once. If both fail, LLMError is raised. There are no retries.
+
+Clients are created once at import. Calls are synchronous because the pipeline runs in a
+worker thread. LLMError messages are vendor-neutral ("primary" / "fallback"); the full
+errors, with provider names, are only written to the server log.
 """
 
+import base64
 import logging
 import time
 
 from google import genai
 from google.genai import types
+from groq import Groq
 
 from OCRAI.config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
     GEMINI_THINKING_BUDGET,
     GEMINI_VISION_MODEL,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    GROQ_VISION_MODEL,
     MAX_OUTPUT_TOKENS,
 )
 
@@ -28,25 +36,40 @@ if not GEMINI_VISION_MODEL:
         "GEMINI_VISION_MODEL is missing. Add it to the .env file, e.g. GEMINI_VISION_MODEL=gemini-2.5-flash"
     )
 
-# Retry temporary failures (503 overloaded, 429 rate limit, 5xx) with growing waits: 2s, 4s, 8s, 16s.
-_client = genai.Client(
+# No retries on either client: each call is sent exactly once.
+_groq = Groq(api_key=GROQ_API_KEY, max_retries=0) if GROQ_API_KEY else None
+_gemini = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(
-        retry_options=types.HttpRetryOptions(
-            attempts=5,
-            initial_delay=2,
-            max_delay=30,
-            http_status_codes=[408, 429, 500, 502, 503, 504],
-        )
-    ),
+    http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(attempts=1)),
 )
+if _groq is None:
+    log.warning("GROQ_API_KEY not set: using Gemini only")
 
 
 class LLMError(RuntimeError):
     pass
 
 
-def _config(**kwargs) -> types.GenerateContentConfig:
+# ---------- Groq (primary) ----------
+
+def _groq_generate(model: str, messages: list, label: str, **kwargs) -> str:
+    start = time.perf_counter()
+    response = _groq.chat.completions.create(model=model, messages=messages, temperature=0, **kwargs)
+    choice = response.choices[0]
+    usage = response.usage
+    log.info(
+        "    LLM %s [Groq %s]: %.2fs | tokens in %s, out %s | finish %s",
+        label, model, time.perf_counter() - start,
+        getattr(usage, "prompt_tokens", None), getattr(usage, "completion_tokens", None), choice.finish_reason,
+    )
+    if choice.finish_reason == "length":
+        raise LLMError("reply was cut off at the output token limit")
+    return choice.message.content or ""
+
+
+# ---------- Gemini (fallback) ----------
+
+def _gemini_config(**kwargs) -> types.GenerateContentConfig:
     if GEMINI_THINKING_BUDGET is not None:
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET)
     return types.GenerateContentConfig(
@@ -56,19 +79,14 @@ def _config(**kwargs) -> types.GenerateContentConfig:
     )
 
 
-def _generate(model: str, contents, config: types.GenerateContentConfig, label: str) -> str:
+def _gemini_generate(model: str, contents, config: types.GenerateContentConfig, label: str) -> str:
     start = time.perf_counter()
-    try:
-        response = _client.models.generate_content(model=model, contents=contents, config=config)
-    except Exception as exc:
-        log.error("    LLM %s failed after %.2fs: %s", label, time.perf_counter() - start, exc)
-        raise LLMError(f"LLM request failed ({type(exc).__name__}).") from exc
-
+    response = _gemini.models.generate_content(model=model, contents=contents, config=config)
     usage = response.usage_metadata
     finish = response.candidates[0].finish_reason if response.candidates else None
     log.info(
-        "    LLM %s: %.2fs | tokens in %s, out %s, thinking %s | finish %s",
-        label, time.perf_counter() - start,
+        "    LLM %s [Gemini %s]: %.2fs | tokens in %s, out %s, thinking %s | finish %s",
+        label, model, time.perf_counter() - start,
         getattr(usage, "prompt_token_count", None),
         getattr(usage, "candidates_token_count", None),
         getattr(usage, "thoughts_token_count", None),
@@ -79,13 +97,46 @@ def _generate(model: str, contents, config: types.GenerateContentConfig, label: 
     return response.text or ""
 
 
+# ---------- Primary -> fallback ----------
+
+def _first_success(label: str, attempts: list[tuple[str, str, object]]) -> str:
+    """Run (role, provider, call) in order; return the first success, else raise LLMError."""
+    failures = []
+    for role, provider, call in attempts:
+        start = time.perf_counter()
+        try:
+            return call()
+        except Exception as exc:
+            log.warning("    LLM %s [%s] failed after %.2fs: %s", label, provider, time.perf_counter() - start, exc)
+            failures.append(f"{role}: {type(exc).__name__}")
+    raise LLMError(f"LLM request failed ({'; '.join(failures)}).")
+
+
 def generate_json(prompt: str) -> str:
     """Structured extraction: prompt in, raw JSON text out."""
-    config = _config(max_output_tokens=MAX_OUTPUT_TOKENS, response_mime_type="application/json")
-    return _generate(GEMINI_MODEL, prompt, config, "extraction")
+    attempts = []
+    if _groq is not None:
+        attempts.append(("primary", "Groq", lambda: _groq_generate(
+            GROQ_MODEL, [{"role": "user", "content": prompt}], "extraction",
+            response_format={"type": "json_object"}, max_completion_tokens=MAX_OUTPUT_TOKENS,
+        )))
+    config = _gemini_config(max_output_tokens=MAX_OUTPUT_TOKENS, response_mime_type="application/json")
+    attempts.append(("fallback", "Gemini", lambda: _gemini_generate(GEMINI_MODEL, prompt, config, "extraction")))
+    return _first_success("extraction", attempts)
 
 
 def generate_from_image(instruction: str, image_bytes: bytes, mime_type: str) -> str:
     """Vision OCR: one message with the instruction and the image."""
+    attempts = []
+    if _groq is not None:
+        data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode()}"
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": instruction},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]}]
+        attempts.append(("primary", "Groq", lambda: _groq_generate(GROQ_VISION_MODEL, messages, "vision OCR")))
     contents = [instruction, types.Part.from_bytes(data=image_bytes, mime_type=mime_type)]
-    return _generate(GEMINI_VISION_MODEL, contents, _config(), "vision OCR")
+    attempts.append(("fallback", "Gemini", lambda: _gemini_generate(
+        GEMINI_VISION_MODEL, contents, _gemini_config(), "vision OCR"
+    )))
+    return _first_success("vision OCR", attempts)
