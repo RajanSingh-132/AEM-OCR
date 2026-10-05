@@ -125,6 +125,19 @@ def generate_json(prompt: str) -> str:
     return _first_success("extraction", attempts)
 
 
+def generate_text(system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str:
+    """Chat answer: system prompt + user message in, plain text out."""
+    attempts = []
+    if _groq is not None:
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        attempts.append(("primary", "Groq", lambda: _groq_generate(
+            GROQ_MODEL, messages, "chat", max_completion_tokens=max_tokens,
+        )))
+    config = _gemini_config(system_instruction=system_prompt, max_output_tokens=max_tokens)
+    attempts.append(("fallback", "Gemini", lambda: _gemini_generate(GEMINI_MODEL, user_prompt, config, "chat")))
+    return _first_success("chat", attempts)
+
+
 def generate_from_image(instruction: str, image_bytes: bytes, mime_type: str) -> str:
     """Vision OCR: one message with the instruction and the image."""
     attempts = []
