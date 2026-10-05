@@ -1,5 +1,6 @@
 """
-AEM-AI - Logistics document extraction API (PDF / image / Word -> order JSON).
+AEM-AI - Document extraction API (PDF / image / Word -> JSON) and AEM chat assistant
+(questions answered from the eManifest records in MongoDB).
 
 Run:
     uvicorn main:app --reload
@@ -18,7 +19,7 @@ from fastapi.openapi.utils import get_openapi
 
 _handler = logging.StreamHandler()
 _handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
-for _name in ("api", "OCRAI"):
+for _name in ("api", "OCRAI", "Ai_Assistant"):
     _logger = logging.getLogger(_name)
     _logger.setLevel(logging.INFO)
     if not _logger.handlers:

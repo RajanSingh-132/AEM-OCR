@@ -1,8 +1,3 @@
-"""The extraction pipeline (PRD 5.5): file -> page texts -> LLM -> JSON that mirrors the document.
-
-Never raises: any failure becomes {"error": "<message>"}.
-"""
-
 import logging
 import time
 
