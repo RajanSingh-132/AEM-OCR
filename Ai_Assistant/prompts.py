@@ -16,6 +16,9 @@ Answer ONLY from those records. Never use outside knowledge to state facts about
 trip, carrier, driver, truck, trailer or shipment. If the records do not contain the answer,
 say so plainly, e.g. "I couldn't find that in the eManifest records." Never guess or invent
 values, and never fill gaps with plausible-looking data.
+The message may also contain CONVERSATION SO FAR (earlier questions and your answers). Use it
+only to understand what a follow-up question refers to ("it", "those trips", "the same
+driver"); take facts from the MANIFEST RECORDS of the current message.
 
 ## You MAY answer
 - Questions about eManifests in the records: trip numbers, status (Draft, Ready, ...), previous
@@ -49,8 +52,16 @@ count or list, say it is based on the records found (e.g. "Among the 10 records 
 - Be concise and direct. Answer in the language the user writes in.
 - Always mention the trip number when you refer to a manifest.
 - Show dates and times readably (e.g. "Oct 5, 2026 at 06:57").
-- Use a short bullet list or a small table when you list several manifests.
-- If several records could match an ambiguous question, list them or ask which one is meant."""
+- NEVER use tables (no "|" columns). Always answer with bullet points, one manifest per bullet:
+  start with the trip number in bold, then its details as short sub-bullets, e.g.
+  - **Trip 322323**
+    - Status: Draft
+    - Arrival: Sep 30, 2026 at 17:02
+    - Carrier (SCAC): 8AVL
+  Show only the details the question asks about, plus the trip number.
+- If several records could match an ambiguous question, list them or ask which one is meant.
+- Never say "the records you provided" or "the set you provided": the user provided nothing;
+  say "the records I found"."""
 
 
 # Answer sent when the company's database has no eManifest data yet ({company_id} is filled in).
@@ -84,8 +95,38 @@ QUESTION:
 """
 
 
-def build_user_prompt(question: str, records: list[dict]) -> str:
-    """The user message: the retrieved records followed by the question."""
+def format_history(turns: list[dict], answer_chars: int) -> str:
+    """Earlier turns as plain text; long answers are shortened."""
+    lines = []
+    for turn in turns:
+        answer = turn.get("answer", "")
+        if len(answer) > answer_chars:
+            answer = answer[:answer_chars] + " ...(shortened)"
+        lines.append(f"User: {turn.get('question', '')}\nAssistant: {answer}")
+    return "\n\n".join(lines)
+
+
+def build_rewrite_prompt(history: str, question: str) -> str:
+    """Turn a follow-up question into a standalone one (used for routing and search)."""
+    return f"""Rewrite the user's latest question so that it can be understood without the conversation.
+
+Rules:
+- Replace references like "it", "that trip", "those", "the same driver", "and the second one?"
+  with the exact trip numbers, IDs, names, ports or dates they refer to in the conversation.
+- Keep the user's language and meaning. Do not answer the question. Do not add new requests.
+- If the question already stands on its own, return it unchanged.
+- Return ONLY the rewritten question, nothing else.
+
+CONVERSATION SO FAR:
+{history}
+
+LATEST QUESTION:
+{question}
+"""
+
+
+def build_user_prompt(question: str, records: list[dict], history: str = "", standalone_question: str = "") -> str:
+    """The user message: earlier conversation (if any), the retrieved records, then the question."""
     if records:
         blocks = [
             f"[Record {i} | relevance {record['score']:.2f}]\n{record['text']}"  # 1.00 = exact ID match
@@ -94,4 +135,11 @@ def build_user_prompt(question: str, records: list[dict]) -> str:
         context = "\n\n".join(blocks)
     else:
         context = "(no matching records were found)"
-    return f"MANIFEST RECORDS ({len(records)} found):\n\n{context}\n\nQUESTION:\n{question}"
+    parts = []
+    if history:
+        parts.append(f"CONVERSATION SO FAR:\n{history}")
+    parts.append(f"MANIFEST RECORDS ({len(records)} found):\n\n{context}")
+    parts.append(f"QUESTION:\n{question}")
+    if standalone_question and standalone_question != question:
+        parts.append(f"(The question means: {standalone_question})")
+    return "\n\n".join(parts)

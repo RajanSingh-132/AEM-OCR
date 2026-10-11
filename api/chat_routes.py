@@ -8,9 +8,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from Ai_Assistant.config import CHAT_MAX_QUESTION_CHARS
-from Ai_Assistant.prompts import COMPANY_NOT_READY_MESSAGE
 from Ai_Assistant.services.chat_service import answer_question
-from Ai_Assistant.services.mongo_client import CompanyDataNotFound
 from OCRAI.llm_client import LLMError
 
 log = logging.getLogger(__name__)
@@ -22,10 +20,16 @@ class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=CHAT_MAX_QUESTION_CHARS,
                           examples=["Which manifests are still in Draft?"])
     company_id: int = Field(..., examples=[5], description="Company id = name of the MongoDB database searched.")
+    session_id: str | None = Field(
+        None, max_length=64,
+        description="Leave empty for a new conversation; send back the session_id from the previous answer "
+                    "to continue it (follow-up questions).",
+    )
 
 
 class ChatResponse(BaseModel):
     answer: str
+    session_id: str
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -40,12 +44,9 @@ async def chat(request: ChatRequest):
     log.info("NEW CHAT QUESTION company %d (%d chars)", request.company_id, len(question))
     try:
         # Embedding, MongoDB and LLM clients are blocking; keep them off the event loop.
-        result = await asyncio.to_thread(answer_question, question, request.company_id)
+        result = await asyncio.to_thread(answer_question, question, request.company_id, request.session_id)
         log.info("DONE in %.2fs", time.perf_counter() - start)
         return result
-    except CompanyDataNotFound as exc:
-        log.warning("  No data for company %d (%s) -> 'working on the data' answer", request.company_id, exc)
-        return {"answer": COMPANY_NOT_READY_MESSAGE.format(company_id=request.company_id)}
     except LLMError as exc:
         log.error("  Answer generation failed: %s", exc)
         raise HTTPException(status_code=502, detail="The assistant could not generate an answer. Please try again.") from exc

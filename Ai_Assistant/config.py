@@ -42,6 +42,15 @@ CHAT_NUM_CANDIDATES = 200     # vector search candidates (higher = better recall
 CHAT_MAX_QUESTION_CHARS = 2000
 CHAT_MAX_ANSWER_TOKENS = 4096
 
+# Chat memory: one document per conversation (session), in a central database so that
+# unknown company ids never create databases.
+CHAT_MEMORY_DB = os.getenv("CHAT_MEMORY_DB", "").strip() or "AEM-AI"
+CHAT_MEMORY_COLLECTION = "chat_sessions"
+CHAT_HISTORY_TURNS = 6        # earlier question/answer pairs used for follow-up questions
+CHAT_MAX_STORED_TURNS = 50    # older turns of a session are dropped
+CHAT_HISTORY_ANSWER_CHARS = 1500  # long answers (tables) are shortened in the history sent to the LLM
+CHAT_SESSION_TTL_DAYS = 7     # sessions unused this long are deleted automatically
+
 
 def require(*names_and_values: tuple[str, str]) -> None:
     """Fail fast with a clear message when a required .env setting is missing."""
