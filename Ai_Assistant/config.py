@@ -37,8 +37,16 @@ VECTOR_FILTER_FIELDS = ("data.CompanyId", "data.USPort", "data.Status", "data.Ar
 EMANIFEST_FILE = Path(__file__).resolve().parent / "eManifest.txt"
 
 # Chat (POST /api/v1/chat)
-CHAT_TOP_K = 10               # records retrieved per question and given to the LLM (fixed, not in the payload)
+# How many records reach the answer LLM depends on the question (see services/query_planner.py):
+LIST_DEFAULT_LIMIT = 10       # list questions that name no number ("which manifests are in Draft?")
+LATEST_DEFAULT_LIMIT = 5      # "latest / most recent ..." with no number
+QUERY_HARD_LIMIT = 25         # absolute maximum of records sent to the LLM for any question
+GROUP_MAX_ROWS = 20           # "count per <field>": largest groups shown
+VECTOR_MIN_SCORE = 0.58       # similarity search: drop records less similar than this
+VECTOR_SCORE_WINDOW = 0.06    # similarity search: keep only records this close to the best match
+VECTOR_MAX_RECORDS = 10       # similarity search: at most this many records
 CHAT_NUM_CANDIDATES = 200     # vector search candidates (higher = better recall, slower)
+ENUM_VALUES_CACHE_SECONDS = 600  # allowed values of "enum" fields are read from the data, cached this long
 CHAT_MAX_QUESTION_CHARS = 2000
 CHAT_MAX_ANSWER_TOKENS = 4096
 
@@ -48,7 +56,8 @@ CHAT_MEMORY_DB = os.getenv("CHAT_MEMORY_DB", "").strip() or "AEM-AI"
 CHAT_MEMORY_COLLECTION = "chat_sessions"
 CHAT_HISTORY_TURNS = 6        # earlier question/answer pairs used for follow-up questions
 CHAT_MAX_STORED_TURNS = 50    # older turns of a session are dropped
-CHAT_HISTORY_ANSWER_CHARS = 1500  # long answers (tables) are shortened in the history sent to the LLM
+CHAT_HISTORY_ANSWER_CHARS = 1500  # long answers are shortened in the history sent to the answer LLM
+PLANNER_HISTORY_ANSWER_CHARS = 400  # ... and shortened more for the planner (it only needs the references)
 CHAT_SESSION_TTL_DAYS = 7     # sessions unused this long are deleted automatically
 
 
