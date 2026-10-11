@@ -7,15 +7,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# MongoDB
+# MongoDB. Each company has its own database, named after its company id
+# (company 10 -> database "10"); every company database uses this collection name.
 MONGO_URI = os.getenv("MONGO_URI", "").strip()
-MONGO_DB = os.getenv("DB", "").strip()
-MONGO_COLLECTION = os.getenv("COLLECTION_NAME", "").strip()
+MONGO_COLLECTION = os.getenv("COLLECTION_NAME", "").strip() or "eManifest"
 
-# Company routing: company_id -> (database, collection) holding that company's eManifests.
-# To add a company later, add its entry here (e.g. from more .env settings).
-_company_id = os.getenv("COMPANY_ID", "").strip()
-COMPANY_ROUTES: dict[int, tuple[str, str]] = {int(_company_id): (MONGO_DB, MONGO_COLLECTION)} if _company_id else {}
+
+def company_db_name(company_id: int) -> str:
+    """MongoDB database name for a company: its id as text."""
+    return str(company_id)
 
 # AWS Bedrock embeddings (Amazon Titan Text Embeddings V2)
 BEDROCK_EMBEDDING_MODEL = os.getenv("bedrockmodel", "amazon.titan-embed-text-v2:0").strip()
@@ -37,8 +37,7 @@ VECTOR_FILTER_FIELDS = ("data.CompanyId", "data.USPort", "data.Status", "data.Ar
 EMANIFEST_FILE = Path(__file__).resolve().parent / "eManifest.txt"
 
 # Chat (POST /api/v1/chat)
-CHAT_TOP_K = 10               # records retrieved per question and given to the LLM
-CHAT_MAX_TOP_K = 50           # upper limit a caller may request
+CHAT_TOP_K = 10               # records retrieved per question and given to the LLM (fixed, not in the payload)
 CHAT_NUM_CANDIDATES = 200     # vector search candidates (higher = better recall, slower)
 CHAT_MAX_QUESTION_CHARS = 2000
 CHAT_MAX_ANSWER_TOKENS = 4096

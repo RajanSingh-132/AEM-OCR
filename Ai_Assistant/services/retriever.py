@@ -1,69 +1,90 @@
-"""Search over the stored eManifest records: exact ID lookup + Atlas Vector Search.
+"""Search over a company's collection: exact ID lookup + Atlas Vector Search.
 
 Embeddings capture meaning, not exact codes, so identifiers in the question (trip numbers,
 truck numbers, plates) are also looked up exactly and those records always come first.
+Field names (text, ids, company, index) come from the collection's CollectionSpec.
 """
 
 import logging
 import re
 import time
 
-from Ai_Assistant.config import CHAT_NUM_CANDIDATES, VECTOR_INDEX_NAME
-from Ai_Assistant.services.embeddings import embed_text
 from pymongo.collection import Collection
+from pymongo.errors import OperationFailure
 
-from Ai_Assistant.services.mongo_client import get_company_collection
+from Ai_Assistant.collection_mapping import CollectionSpec
+from Ai_Assistant.config import CHAT_NUM_CANDIDATES
+from Ai_Assistant.services.embeddings import embed_text
+from Ai_Assistant.services.mongo_client import ensure_vector_index_once, get_company_collection
 
 log = logging.getLogger(__name__)
 
-# Identifier fields matched exactly against tokens in the question.
-ID_FIELDS = ("data.TripNum", "data.conveyanceNumber", "data.LpOne", "data.ShipmentControl", "data.ReferenceID")
 # Token that looks like an identifier: 4+ letters/digits/-/_ and at least one digit.
 _ID_TOKEN = re.compile(r"(?=[\w-]*\d)[\w-]{4,}")
-_PROJECTION = {"_id": 1, "text": 1, "trip_number": "$data.TripNum", "status": "$data.Status", "port": "$data.USPortName"}
 
 
-def _to_record(doc: dict, score: float) -> dict:
-    return {"id": doc["_id"], **{k: doc.get(k) for k in ("trip_number", "status", "port", "text")}, "score": score}
+def _projection(spec: CollectionSpec) -> dict:
+    return {
+        "_id": 1,
+        "text": f"${spec.text_field}",
+        **{name: f"${field}" for name, field in spec.summary_fields.items()},
+    }
 
 
-def exact_matches(collection: Collection, question: str, company_id: int) -> list[dict]:
+def _to_record(doc: dict, score: float, spec: CollectionSpec) -> dict:
+    return {
+        "id": doc["_id"],
+        "text": doc.get("text") or "",
+        **{name: doc.get(name) for name in spec.summary_fields},
+        "score": score,
+    }
+
+
+def exact_matches(collection: Collection, spec: CollectionSpec, question: str, company_id: int) -> list[dict]:
     """Records whose trip number, truck number, plate etc. appears literally in the question."""
-    tokens = {t for t in _ID_TOKEN.findall(question)} | {t.upper() for t in _ID_TOKEN.findall(question)}
+    found = _ID_TOKEN.findall(question)
+    tokens = list({*found, *(t.upper() for t in found)})
     if not tokens:
         return []
-    query = {"data.CompanyId": company_id, "$or": [{field: {"$in": list(tokens)}} for field in ID_FIELDS]}
-    return [_to_record(doc, 1.0) for doc in collection.aggregate([{"$match": query}, {"$project": _PROJECTION}])]
+    query = {spec.company_field: company_id, "$or": [{field: {"$in": tokens}} for field in spec.id_fields]}
+    pipeline = [{"$match": query}, {"$project": _projection(spec)}]
+    return [_to_record(doc, 1.0, spec) for doc in collection.aggregate(pipeline)]
 
 
-def search(question: str, top_k: int, company_id: int) -> list[dict]:
-    """Best records for the question: [{id, trip_number, status, port, text, score}].
+def search(question: str, top_k: int, company_id: int, spec: CollectionSpec) -> list[dict]:
+    """Best records for the question: [{id, text, <summary fields>, score}].
 
-    company_id picks the database/collection (COMPANY_ROUTES) and also filters inside it,
-    so a company only ever sees its own manifests. Unknown company -> UnknownCompanyError.
+    company_id is the database name (company 5 -> database "5") and also filters inside it,
+    so a company only ever sees its own records. No data for the company -> CompanyDataNotFound.
     """
-    collection = get_company_collection(company_id)  # fails fast, before any embedding cost
+    collection = get_company_collection(company_id, spec.name)  # fails fast, before any embedding cost
     log.info("  Company %d -> %s.%s", company_id, collection.database.name, collection.name)
+    ensure_vector_index_once(collection, spec.vector_index, spec.filter_fields, spec.embedding_field)
 
     start = time.perf_counter()
     vector = embed_text(question)
     log.info("[1/3] Question embedded in %.2fs", time.perf_counter() - start)
 
     start = time.perf_counter()
-    exact = exact_matches(collection, question, company_id)
+    exact = exact_matches(collection, spec, question, company_id)
 
     pipeline = [
         {"$vectorSearch": {
-            "index": VECTOR_INDEX_NAME,
-            "path": "embedding",
+            "index": spec.vector_index,
+            "path": spec.embedding_field,
             "queryVector": vector,
             "numCandidates": max(CHAT_NUM_CANDIDATES, top_k),
             "limit": top_k,
-            "filter": {"data.CompanyId": company_id},
+            "filter": {spec.company_field: company_id},
         }},
-        {"$project": {**_PROJECTION, "score": {"$meta": "vectorSearchScore"}}},
+        {"$project": {**_projection(spec), "score": {"$meta": "vectorSearchScore"}}},
     ]
-    similar = [_to_record(doc, doc["score"]) for doc in collection.aggregate(pipeline)]
+    try:
+        similar = [_to_record(doc, doc["score"], spec) for doc in collection.aggregate(pipeline)]
+    except OperationFailure as exc:
+        # e.g. a just-created index is still building (INITIAL_SYNC): answer from exact matches only.
+        log.warning("  Vector search unavailable on %s.%s: %s", collection.database.name, collection.name, exc.details.get("errmsg", exc) if exc.details else exc)
+        similar = []
 
     # Exact ID matches first, then the most similar records, without duplicates.
     seen = {r["id"] for r in exact}

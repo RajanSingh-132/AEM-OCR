@@ -53,6 +53,37 @@ count or list, say it is based on the records found (e.g. "Among the 10 records 
 - If several records could match an ambiguous question, list them or ask which one is meant."""
 
 
+# Answer sent when the company's database has no eManifest data yet ({company_id} is filled in).
+COMPANY_NOT_READY_MESSAGE = "We are working on the data for company ID {company_id}. I'll be with you shortly! 😊"
+
+# Answer sent when the question does not belong to any collection (greetings land here too).
+OUT_OF_SCOPE_MESSAGE = (
+    "Hi! I can help you with questions about your eManifest records, for example a trip's status, "
+    "carrier, port of arrival, arrival time, driver, truck, trailers or seals. "
+    "Please ask me something about your eManifests. 😊"
+)
+
+
+def build_collection_router_prompt(question: str, collections: dict) -> str:
+    """One LLM call: which collection (if any) does the question belong to? Reply is JSON."""
+    options = "\n".join(f'- "{name}": {spec.description}' for name, spec in collections.items())
+    return f"""You route a user's question to the database collection that can answer it.
+
+Collections:
+{options}
+
+Decide whether answering the question needs data from one of these collections. The question
+may be in any language, have typos, or not name the collection (e.g. asking about a trip,
+driver, truck, trailer, port or arrival is about eManifests). Greetings, small talk, and
+questions about anything else belong to no collection.
+
+Return ONLY a JSON object: {{"collection": "<one of the names above>"}} or {{"collection": null}}.
+
+QUESTION:
+{question}
+"""
+
+
 def build_user_prompt(question: str, records: list[dict]) -> str:
     """The user message: the retrieved records followed by the question."""
     if records:

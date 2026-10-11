@@ -1,6 +1,7 @@
 """Store eManifest records in MongoDB with a 1024-d text embedding per record.
 
-Each record becomes one document, in this field order:
+Each record is stored in the database named after its CompanyId (company 5 -> database "5"),
+in the collection COLLECTION_NAME from .env. Each record becomes one document, in this field order:
     _id        the eManifest "Id" (re-running replaces instead of duplicating)
     data       the original JSON record, unchanged and in the same field order as the file
     text       readable summary of the record; this is what was embedded (semantic search)
@@ -19,13 +20,21 @@ import argparse
 import json
 import logging
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pymongo import ReplaceOne
 
-from Ai_Assistant.config import BEDROCK_EMBEDDING_MODEL, EMANIFEST_FILE, EMBEDDING_DIMENSIONS, EMBEDDING_WORKERS
+from Ai_Assistant.config import (
+    BEDROCK_EMBEDDING_MODEL,
+    EMANIFEST_FILE,
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_WORKERS,
+    MONGO_COLLECTION,
+    company_db_name,
+)
 from Ai_Assistant.services.embeddings import embed_text
 from Ai_Assistant.services.mongo_client import ensure_vector_index, get_collection, ping
 
@@ -116,27 +125,37 @@ def _embed(item: tuple[dict, str]) -> tuple[dict, str, list[float] | None]:
 
 
 def store(path: Path, limit: int | None, force: bool) -> None:
+    """Each record goes to the database named after its CompanyId (company 5 -> database "5")."""
     run_start = time.perf_counter()
 
     log.info("[1/4] Connecting to MongoDB...")
     ping()
-    collection = get_collection()
 
     records = load_records(path)[:limit]
-    items = [(record, build_text(record)) for record in records]
+    by_company: dict[int, list[tuple[dict, str]]] = defaultdict(list)
+    for record in records:
+        if record.get("CompanyId") is None:
+            log.warning("  Id %s has no CompanyId -> skipped", record.get("Id"))
+            continue
+        by_company[record["CompanyId"]].append((record, build_text(record)))
+    log.info("  Companies in file: %s", ", ".join(
+        f"{cid} -> {company_db_name(cid)}.{MONGO_COLLECTION} ({len(items)})" for cid, items in by_company.items()
+    ))
 
     log.info("[3/4] Embedding with %s (%d dims)...", BEDROCK_EMBEDDING_MODEL, EMBEDDING_DIMENSIONS)
-    existing = {}
-    if not force:
-        ids = [record["Id"] for record, _ in items]
-        existing = {doc["_id"]: doc for doc in collection.find({"_id": {"$in": ids}}, {"data": 1, "text": 1})}
-
-    def unchanged(record: dict, text: str) -> bool:
-        doc = existing.get(record["Id"])
-        return doc is not None and doc.get("data") == record and doc.get("text") == text
-
-    todo = [(r, t) for r, t in items if force or not unchanged(r, t)]
-    skipped = len(items) - len(todo)
+    todo, skipped = [], 0
+    for company_id, items in by_company.items():
+        existing = {}
+        if not force:
+            ids = [record["Id"] for record, _ in items]
+            collection = get_collection(company_db_name(company_id))
+            existing = {doc["_id"]: doc for doc in collection.find({"_id": {"$in": ids}}, {"data": 1, "text": 1})}
+        for record, text in items:
+            doc = existing.get(record["Id"])
+            if doc is not None and doc.get("data") == record and doc.get("text") == text:
+                skipped += 1
+            else:
+                todo.append((record, text))
     if skipped:
         log.info("  %d record(s) unchanged since last run -> skipped", skipped)
 
@@ -148,28 +167,31 @@ def store(path: Path, limit: int | None, force: bool) -> None:
     log.info("[3/4] Embedded %d record(s) in %.2fs (%d failed)", len(embedded), time.perf_counter() - start, failed)
 
     log.info("[4/4] Saving to MongoDB...")
-    start = time.perf_counter()
     now = datetime.now(timezone.utc)
-    operations = [
+    operations: dict[int, list[ReplaceOne]] = defaultdict(list)
+    for record, text, embedding in embedded:
         # Whole-document replace keeps this field order ($set would sort fields alphabetically).
-        ReplaceOne(
+        operations[record["CompanyId"]].append(ReplaceOne(
             {"_id": record["Id"]},
             {"_id": record["Id"], "data": record, "text": text, "embedding": embedding, "stored_at": now},
             upsert=True,
-        )
-        for record, text, embedding in embedded
-    ]
-    if operations:
-        result = collection.bulk_write(operations, ordered=False)
-        log.info(
-            "[4/4] Saved in %.2fs: %d new, %d replaced",
-            time.perf_counter() - start, result.upserted_count, result.modified_count,
-        )
-    ensure_vector_index(collection)
+        ))
+    for company_id in by_company:
+        collection = get_collection(company_db_name(company_id))
+        start = time.perf_counter()
+        if operations[company_id]:
+            result = collection.bulk_write(operations[company_id], ordered=False)
+            log.info(
+                "[4/4] %s.%s: %d new, %d replaced in %.2fs",
+                collection.database.name, collection.name,
+                result.upserted_count, result.modified_count, time.perf_counter() - start,
+            )
+        ensure_vector_index(collection)
+        log.info("  %s.%s now has %d document(s)", collection.database.name, collection.name, collection.count_documents({}))
 
     log.info(
-        "DONE in %.2fs | %d stored, %d unchanged, %d failed | collection now has %d document(s)",
-        time.perf_counter() - run_start, len(embedded), skipped, failed, collection.count_documents({}),
+        "DONE in %.2fs | %d stored, %d unchanged, %d failed",
+        time.perf_counter() - run_start, len(embedded), skipped, failed,
     )
 
 
