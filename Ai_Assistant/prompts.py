@@ -77,16 +77,19 @@ question refers to; take facts from the current QUERY RESULT.
 
 ## Style
 - Be concise and direct. Answer in the language the user writes in.
-- Always mention the trip number when you refer to a manifest.
+- Refer to a manifest by SCAC + trip number, e.g. "19E5 TRPRPXG5S" (trip numbers alone can
+  repeat across carriers).
+- When an "Identifier" line says a value matched more than one meaning (e.g. SCAC + trip
+  number, and also a stored trip number), list each matching manifest and say which is which.
 - Show dates and times readably (e.g. "Oct 5, 2026 at 06:57"). Records store dates as
   YYYYMMDD and times as HHMM (a 3-digit time like 515 means 05:15).
 - NEVER use tables (no "|" columns). Use bullet points, one manifest per bullet: start with
-  the trip number in bold, then its details as short sub-bullets, e.g.
-  - **Trip 322323**
+  the SCAC + trip number in bold, then its details as short sub-bullets, e.g.
+  - **8AVL 322323**
     - Status: Draft
     - Arrival: Sep 30, 2026 at 17:02
-    - Carrier (SCAC): 8AVL
-  Show only the details the question asks about, plus the trip number.
+    - U.S. port: DETROIT,MI
+  Show only the details the question asks about, plus the SCAC + trip number.
 - For counts per group, use one bullet per group ("- Draft: 1,477").
 - If several records could match an ambiguous question, list them or ask which one is meant."""
 
@@ -121,6 +124,12 @@ _PLANNER_RULES = """
 ## Intents
 - "lookup": the question names specific identifiers (trip number, truck/conveyance number,
   license plate). Put them in "ids" exactly as written. Example: "status of trip 45444".
+  eManifests are usually named as SCAC + trip number in one value ("19E5TRPRPXG5S",
+  "19E5 TRPRPXG5S", "19E5-TRPRPXG5S"): copy such a value into "ids" exactly as written, as ONE
+  value; do NOT split it (the system splits it). If the user gives SCAC and trip number
+  separately ("SCAC 19E5 trip TRPRPXG5S"), put both values in "ids".
+  A SCAC alone, asked about as a carrier ("manifests of 19E5", "how many for 8AVL?"), is not a
+  lookup: use a Scac filter with "list" or "count".
 - "list": show records matching conditions, optionally sorted / limited. Examples: "Draft
   manifests at Detroit", "latest 3 eManifests", "manifests arriving tomorrow".
 - "count": ONLY a number is asked ("how many are in Draft?"). For "how many per status /
@@ -173,6 +182,10 @@ Return ONLY one JSON object:
 {"collection": "emanifest", "standalone_question": "which trips arrive at Detroit this week?", "intent": "list", "ids": [], "filters": [{"field": "USPortName", "op": "contains", "value": "DETROIT"}, {"field": "ArrivalDate", "op": "between", "value": ["2026-10-12", "2026-10-18"]}], "sort": {"by": "arrival", "order": "asc"}, "limit": null, "group_by": null}
 "count manifests per status" ->
 {"collection": "emanifest", "standalone_question": "count manifests per status", "intent": "count", "ids": [], "filters": [], "sort": null, "limit": null, "group_by": "Status"}
+"19E5TRPRPXG5S emanifest details" ->
+{"collection": "emanifest", "standalone_question": "19E5TRPRPXG5S emanifest details", "intent": "lookup", "ids": ["19E5TRPRPXG5S"], "filters": [], "sort": null, "limit": null, "group_by": null}
+"how many manifests does SCAC 8AVL have?" ->
+{"collection": "emanifest", "standalone_question": "how many manifests does SCAC 8AVL have?", "intent": "count", "ids": [], "filters": [{"field": "Scac", "op": "eq", "value": "8AVL"}], "sort": null, "limit": null, "group_by": null}
 after "status of trip 45444?", the question "and who is the driver?" ->
 {"collection": "emanifest", "standalone_question": "who is the driver of trip 45444?", "intent": "lookup", "ids": ["45444"], "filters": [], "sort": null, "limit": null, "group_by": null}
 "hi" ->

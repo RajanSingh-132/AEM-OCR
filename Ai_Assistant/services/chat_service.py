@@ -25,6 +25,7 @@ from Ai_Assistant.prompts import (
     format_history,
 )
 from Ai_Assistant.services.chat_memory import save_turn, start_session
+from Ai_Assistant.services.id_resolver import resolve_ids
 from Ai_Assistant.services.mongo_client import (
     CompanyDataNotFound,
     ensure_vector_index_once,
@@ -42,6 +43,8 @@ from Ai_Assistant.services.structured_query import (
 from OCRAI import llm_client
 
 log = logging.getLogger(__name__)
+
+_NOTHING = {"_id": {"$in": []}}  # matches no document (identifiers that resolved to nothing)
 
 
 def answer_question(question: str, company_id: int, session_id: str | None = None) -> dict:
@@ -83,8 +86,13 @@ def fetch_data(plan: Plan, collection, company_id: int) -> QueryResult:
     if plan.intent == "semantic":
         return similarity_search(collection, spec, plan.standalone_question, company_id)
 
-    ids = plan.ids if plan.intent == "lookup" else []
-    match = build_match(spec, company_id, plan.filters, ids)
+    match = build_match(spec, company_id, plan.filters)
+    id_lines = []
+    if plan.ids:
+        # SCAC + trip number / trip number / other IDs / SCAC only, resolved against the real data.
+        resolution = resolve_ids(collection, spec, company_id, plan.ids, match)
+        id_lines = resolution.lines
+        match = build_match(spec, company_id, plan.filters, resolution.condition or _NOTHING)
     if plan.intent == "count":
         result = count_records(collection, spec, match, plan.group_by)
     else:
@@ -94,5 +102,6 @@ def fetch_data(plan: Plan, collection, company_id: int) -> QueryResult:
             # Nothing matched exactly (e.g. a misspelled name): offer the closest records,
             # clearly labeled as not matching.
             result.related = similarity_search(collection, spec, plan.standalone_question, company_id).records
-    result.description.insert(1, f"Conditions: {describe_conditions(plan.filters, ids)}")
+    result.description[1:1] = [f"Conditions: {describe_conditions(plan.filters)}",
+                               *(f"Identifier {line}" for line in id_lines)]
     return result
