@@ -73,11 +73,12 @@ def _condition(kind: str, f: Filter) -> dict:
     return {f.field: _exact(f.value)}
 
 
-def build_match(spec: CollectionSpec, company_id: int, filters: list[Filter], ids: list[str]) -> dict:
+def build_match(spec: CollectionSpec, company_id: int, filters: list[Filter], extra: dict | None = None) -> dict:
+    """Company filter + validated filters (+ an extra condition, e.g. resolved identifiers)."""
     conditions = [{spec.company_field: company_id}]
     conditions += [_condition(spec.query_fields[f.field].kind, f) for f in filters]
-    if ids:
-        conditions.append({"$or": [{field: exact_any(ids)} for field in spec.id_fields]})
+    if extra:
+        conditions.append(extra)
     return {"$and": conditions}
 
 
@@ -85,10 +86,8 @@ _OP_TEXT = {"eq": "is", "in": "is one of", "contains": "contains", "gte": "is on
             "lte": "is on or before", "between": "is between"}
 
 
-def describe_conditions(filters: list[Filter], ids: list[str]) -> str:
+def describe_conditions(filters: list[Filter]) -> str:
     parts = []
-    if ids:
-        parts.append(f"ID (trip number, truck number or plate) is one of {', '.join(repr(i) for i in ids)}")
     for f in filters:
         if f.op == "between":
             value = f"{f.value[0]} and {f.value[1]}"

@@ -57,6 +57,9 @@ class CollectionSpec:
     text_field: str                 # readable text of one record (embedded; sent to the LLM)
     company_field: str              # field holding the company id (always filtered on, in code)
     id_fields: tuple[str, ...]      # identifiers looked up exactly
+    # (code field, trip field): users often write both as one value, e.g. SCAC "19E5" + trip
+    # number "TRPRPXG5S" = "19E5TRPRPXG5S" (see services/id_resolver.py).
+    trip_key: tuple[str, str] | None = None
     record_label: str = "record"    # what one document is called in answers
     query_fields: dict[str, QueryField] = field(default_factory=dict)
     sorts: dict[str, SortSpec] = field(default_factory=dict)
@@ -119,6 +122,7 @@ EMANIFEST = CollectionSpec(
     text_field="page_content",
     company_field="CompanyId",
     id_fields=("TripNum", "conveyanceNumber", "LpOne", "ShipmentControl", "ReferenceID"),
+    trip_key=("Scac", "TripNum"),
     record_label="eManifest",
     query_fields={
         "TripNum": QueryField("id", "trip number, e.g. '45444', 'TRP562334'"),
