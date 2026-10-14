@@ -13,6 +13,11 @@ from OCRAI.schemas import TEMPLATES
 # Vision OCR (PRD 5.1): sent together with one image.
 OCR_INSTRUCTION = (
     "Extract readable text from this image exactly as present. "
+    "Copy every word, code and number character by character as printed, including spelling "
+    "mistakes and unusual words (e.g. 'AAPLE' stays 'AAPLE'); never correct, complete or reformat "
+    "anything. Keep the reading order. Tables: write the header row, then each row on one line "
+    "with the cells separated by ' | '; text that wraps onto several lines inside one cell belongs "
+    "to that cell, so join it in reading order and never mix it with neighbouring cells. "
     "If the image has no readable text, reply with: NO_TEXT_FOUND"
 )
 
@@ -59,8 +64,17 @@ _RULES = """
    the document says co-driver ("Co-Driver").
 8. Letterheads, logos and footers of the company that supplies the blank form (software
    vendor, form printer) are NOT data: never put them in any field.
-9. Correct obvious OCR mistakes only when certain. Copy IDs, plates and numbers exactly
-   (keep letters, digits and leading zeros).
+9. Copy values exactly as they appear in the document text: never correct spelling, even if a
+   word looks misspelled (a commodity "AAPLE" stays "AAPLE"). Copy IDs, plates and numbers
+   exactly (keep letters, digits and leading zeros).
+10. Addresses: split a written address into its parts without losing any of them. The
+   address field gets the full street part (number, street, suite / unit / building); city,
+   province/state, country and postal/ZIP code go to their own fields. Example: "500 MAIN ST
+   UNIT 4 90210, LOS ANGELES, CA, US" -> address "500 MAIN ST UNIT 4", postal "90210", city
+   "LOS ANGELES", province/state "CA", country "US". If the template has no postal field, keep
+   the postal code at the end of the address. Never put only the postal code in the address.
+11. A party's name goes in its name field only when the document states a name; never use
+   the address or the form provider's name as the name.
 """
 
 _FIELD_GUIDES = {
