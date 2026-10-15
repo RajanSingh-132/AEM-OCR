@@ -196,6 +196,17 @@ def _embedded_image_text(page, index: int, filename: str) -> str:
     return "\n".join(texts)
 
 
+def _render_text(state: "_PdfOcr", index: int, filename: str) -> str | None:
+    """OCR of the rendered page, or None when rendering fails or the page has no readable text."""
+    try:
+        image = state.render_page(index)
+    except Exception:
+        log.exception("    Could not render page %d", index + 1)
+        return None
+    text = ocr_image(image, f"{filename}_p{index}_render.png")
+    return text if text and real_words(text) else None
+
+
 def load_pdf(data: bytes, filename: str) -> list[str]:
     reader = PdfReader(io.BytesIO(data))
     if reader.is_encrypted:
@@ -226,6 +237,21 @@ def load_pdf(data: bytes, filename: str) -> list[str]:
             text_layer = pages[i].strip()
             word_count = len(real_words(text_layer))
 
+            # Weak / empty text layer: OCR the whole rendered page. It sees everything visible:
+            # text drawn as shapes (e.g. browser "Print to PDF"), images, tables. Embedded-image
+            # OCR alone can return only a logo and miss all the data on such pages.
+            if word_count < MIN_REAL_WORDS and pdfium is not None:
+                render_text = _render_text(state, i, filename)
+                if render_text:
+                    if word_count >= MIN_RENDER_KEEP_WORDS:
+                        pages[i] = text_layer + "\n\n=== PAGE RENDER OCR ===\n" + render_text
+                    elif len(render_text) > len(text_layer):
+                        pages[i] = render_text
+                    log.info("  Page %d: %d words in text layer, Tier 3 (page render) -> %d chars, %.2fs",
+                             i + 1, word_count, len(pages[i]), time.perf_counter() - start)
+                    continue
+                log.warning("  Page %d: page render gave no text -> trying embedded images", i + 1)
+
             ocr_text = _embedded_image_text(page, i, filename)
             tier = "2 (embedded images)"
             if not ocr_text:
@@ -246,20 +272,10 @@ def load_pdf(data: bytes, filename: str) -> list[str]:
                          i + 1, word_count, tier, result, len(pages[i]), time.perf_counter() - start)
                 continue
 
-            if pdfium is None or word_count >= MIN_REAL_WORDS:
-                reason = "rich text layer" if word_count >= MIN_REAL_WORDS else "pypdfium2 not installed"
-                log.info("  Page %d: %d words in text layer, no image text, Tier 3 skipped (%s), %.2fs",
-                         i + 1, word_count, reason, time.perf_counter() - start)
-                continue
-
-            render_text = ocr_image(state.render_page(i), f"{filename}_p{i}_render.png")
-            if render_text and real_words(render_text):
-                if word_count >= MIN_RENDER_KEEP_WORDS:
-                    pages[i] = text_layer + "\n\n=== PAGE RENDER OCR ===\n" + render_text
-                elif len(render_text) > len(text_layer):
-                    pages[i] = render_text
-            log.info("  Page %d: %d words in text layer, Tier 3 (page render) -> %d chars, %.2fs",
-                     i + 1, word_count, len(pages[i]), time.perf_counter() - start)
+            reason = "rich text layer" if word_count >= MIN_REAL_WORDS else \
+                "pypdfium2 not installed" if pdfium is None else "page render gave no text"
+            log.info("  Page %d: %d words in text layer, no image text (%s), %.2fs",
+                     i + 1, word_count, reason, time.perf_counter() - start)
     finally:
         state.close()
 
