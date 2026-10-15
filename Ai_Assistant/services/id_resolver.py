@@ -45,17 +45,24 @@ def normalize(value: str) -> str:
 
 # ---------- real SCAC codes (cached per company) ----------
 
-_scac_cache: dict[tuple, tuple[float, set[str]]] = {}
+_scac_cache: dict[tuple, tuple[float, dict[str, list[str]]]] = {}
 
 
-def known_codes(collection: Collection, spec: CollectionSpec, company_id: int) -> set[str]:
+def known_codes(collection: Collection, spec: CollectionSpec, company_id: int) -> dict[str, list[str]]:
+    """{normalized SCAC: [values as stored]}, e.g. {"AF1": ["AF-1"], "AFM1": ["AFM1"]}.
+
+    Users write "AF1" or "AF-1"; queries must use the stored value ("AF-1").
+    """
     if not spec.trip_key:
-        return set()
+        return {}
     key = (collection.database.name, collection.name, company_id)
     cached = _scac_cache.get(key)
     if cached and time.monotonic() - cached[0] < ENUM_VALUES_CACHE_SECONDS:
         return cached[1]
-    codes = {normalize(v) for v in collection.distinct(spec.trip_key[0], {spec.company_field: company_id}) if v}
+    codes: dict[str, list[str]] = {}
+    for value in collection.distinct(spec.trip_key[0], {spec.company_field: company_id}):
+        if value:
+            codes.setdefault(normalize(value), []).append(str(value))
     _scac_cache[key] = (time.monotonic(), codes)
     return codes
 
@@ -102,11 +109,11 @@ def resolve_ids(collection: Collection, spec: CollectionSpec, company_id: int,
             for other in values:
                 if other == code_value or other in used:
                     continue
-                condition = {code_field: exact_any([code]), trip_field: exact_any(_variants(other))}
+                condition = {code_field: exact_any(codes[code]), trip_field: exact_any(_variants(other))}
                 n = count(condition)
                 if n:
                     matched.append(condition)
-                    lines.append(f"'{code_value}' + '{other}' = SCAC {code} + trip number {other}: {n} record(s)")
+                    lines.append(f"'{code_value}' + '{other}' = SCAC {'/'.join(codes[code])} + trip number {other}: {n} record(s)")
                     used.update((code_value, other))
 
     for value in values:
@@ -120,8 +127,8 @@ def resolve_ids(collection: Collection, spec: CollectionSpec, company_id: int,
             for size in sorted({len(c) for c in codes}, reverse=True):
                 prefix, rest = norm[:size], norm[size:]
                 if rest and prefix in codes:
-                    readings.append(({code_field: exact_any([prefix]), trip_field: exact_any([rest])},
-                                     f"SCAC {prefix} + trip number {rest}"))
+                    readings.append(({code_field: exact_any(codes[prefix]), trip_field: exact_any([rest])},
+                                     f"SCAC {'/'.join(codes[prefix])} + trip number {rest}"))
         # 2. Trip number as stored. 3. Other identifiers.
         for id_field in spec.id_fields:
             readings.append(({id_field: exact_any(_variants(value))}, f"{_id_label(spec, id_field)} '{value}'"))
@@ -129,9 +136,9 @@ def resolve_ids(collection: Collection, spec: CollectionSpec, company_id: int,
         found = [(condition, label, n) for condition, label in readings if (n := count(condition))]
         # 4. SCAC only, when nothing more specific matched.
         if not found and allow_code_only and code_field and norm in codes:
-            condition = {code_field: exact_any([norm])}
+            condition = {code_field: exact_any(codes[norm])}
             if n := count(condition):
-                found.append((condition, f"all eManifests of SCAC {norm}", n))
+                found.append((condition, f"all {spec.record_label} records of SCAC {'/'.join(codes[norm])}", n))
 
         if found:
             matched.extend(condition for condition, _, _ in found)

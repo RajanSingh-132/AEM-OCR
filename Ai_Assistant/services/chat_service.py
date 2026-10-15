@@ -10,7 +10,9 @@ How many records reach the answer LLM depends on the question:
 
 import logging
 import time
+from dataclasses import replace
 
+from Ai_Assistant.collection_mapping import COLLECTIONS
 from Ai_Assistant.config import (
     CHAT_HISTORY_ANSWER_CHARS,
     CHAT_MAX_ANSWER_TOKENS,
@@ -68,7 +70,12 @@ def _answer(question: str, plan: Plan, history: str, company_id: int) -> str:
     log.info("  Company %d -> %s.%s", company_id, collection.database.name, collection.name)
     ensure_vector_index_once(collection, spec.vector_index, spec.filter_fields, spec.embedding_field)
 
-    result = fetch_data(plan, collection, company_id)
+    is_id_lookup = plan.intent == "lookup" and bool(plan.ids)
+    result = fetch_data(plan, collection, company_id, related_on_empty=not is_id_lookup)
+    if is_id_lookup and result.total == 0:
+        # The IDs are not in this collection: they may belong to the other one (e.g. "trip 45444"
+        # asked as a trip, but it is an ACE eManifest trip number).
+        result = _lookup_in_other_collections(plan, company_id) or _with_related(result, plan, collection, company_id)
 
     log.info("[3/3] Generating answer...")
     start = time.perf_counter()
@@ -80,7 +87,37 @@ def _answer(question: str, plan: Plan, history: str, company_id: int) -> str:
     return answer
 
 
-def fetch_data(plan: Plan, collection, company_id: int) -> QueryResult:
+def _with_related(result: QueryResult, plan: Plan, collection, company_id: int) -> QueryResult:
+    """Attach the closest records (clearly labeled as not matching) to an empty exact result."""
+    result.related = similarity_search(collection, plan.collection, plan.standalone_question, company_id).records
+    return result
+
+
+def _lookup_in_other_collections(plan: Plan, company_id: int) -> QueryResult | None:
+    """Look the plan's IDs up in the company's other collections; the first that has them wins."""
+    for spec in COLLECTIONS.values():
+        if spec is plan.collection:
+            continue
+        try:
+            collection = get_company_collection(company_id, spec.name)
+        except CompanyDataNotFound:
+            continue
+        resolution = resolve_ids(collection, spec, company_id, plan.ids, build_match(spec, company_id, []))
+        if resolution.condition is None:
+            continue
+        log.info("  IDs not found as %s -> found as %s in %s.%s",
+                 plan.collection.record_label, spec.record_label, collection.database.name, collection.name)
+        ensure_vector_index_once(collection, spec.vector_index, spec.filter_fields, spec.embedding_field)
+        # Filters were written for the first collection's fields, so only the IDs carry over.
+        other_plan = replace(plan, collection=spec, filters=[], sort=None, group_by=None)
+        result = fetch_data(other_plan, collection, company_id, related_on_empty=False)
+        result.description.insert(0, f"Note: no {plan.collection.record_label} record has these IDs; "
+                                     f"they were found as {spec.record_label} records instead")
+        return result
+    return None
+
+
+def fetch_data(plan: Plan, collection, company_id: int, related_on_empty: bool = True) -> QueryResult:
     """Run the plan: exact query for lookup / list / count, similarity search for semantic."""
     spec = plan.collection
     if plan.intent == "semantic":
@@ -98,10 +135,10 @@ def fetch_data(plan: Plan, collection, company_id: int) -> QueryResult:
     else:
         limit = plan.limit or (QUERY_HARD_LIMIT if plan.intent == "lookup" else None)
         result = fetch_records(collection, spec, match, plan.sort, limit, plan.intent)
-        if result.total == 0:
+        if result.total == 0 and related_on_empty:
             # Nothing matched exactly (e.g. a misspelled name): offer the closest records,
             # clearly labeled as not matching.
-            result.related = similarity_search(collection, spec, plan.standalone_question, company_id).records
+            _with_related(result, plan, collection, company_id)
     result.description[1:1] = [f"Conditions: {describe_conditions(plan.filters)}",
                                *(f"Identifier {line}" for line in id_lines)]
     return result

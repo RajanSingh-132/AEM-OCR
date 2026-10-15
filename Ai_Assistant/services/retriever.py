@@ -23,21 +23,13 @@ from Ai_Assistant.config import (
 )
 from Ai_Assistant.services.embeddings import embed_text
 from Ai_Assistant.services.id_resolver import known_codes, normalize, resolve_ids
-from Ai_Assistant.services.structured_query import QueryResult
+from Ai_Assistant.services.structured_query import QueryResult, record_projection, to_record
 
 log = logging.getLogger(__name__)
 
 # Token that looks like an identifier: 4+ letters/digits/-/_ and at least one digit.
 _ID_TOKEN = re.compile(r"(?=[\w-]*\d)[\w-]{4,}")
 _WORD = re.compile(r"[\w-]+")
-
-
-def _projection(spec: CollectionSpec) -> dict:
-    return {"_id": 1, "text": f"${spec.text_field}", **{n: f"${f}" for n, f in spec.summary_fields.items()}}
-
-
-def _to_record(doc: dict, score: float, spec: CollectionSpec) -> dict:
-    return {"id": doc["_id"], "text": doc.get("text") or "", **{n: doc.get(n) for n in spec.summary_fields}, "score": score}
 
 
 def exact_id_matches(collection: Collection, spec: CollectionSpec, question: str, company_id: int) -> list[dict]:
@@ -54,8 +46,8 @@ def exact_id_matches(collection: Collection, spec: CollectionSpec, question: str
     if resolution.condition is None:
         return []
     pipeline = [{"$match": {"$and": [base, resolution.condition]}}, {"$limit": QUERY_HARD_LIMIT},
-                {"$project": _projection(spec)}]
-    return [_to_record(doc, 1.0, spec) for doc in collection.aggregate(pipeline)]
+                {"$project": record_projection(spec)}]
+    return [to_record(doc, spec, 1.0) for doc in collection.aggregate(pipeline)]
 
 
 def similarity_search(collection: Collection, spec: CollectionSpec, question: str, company_id: int) -> QueryResult:
@@ -74,10 +66,10 @@ def similarity_search(collection: Collection, spec: CollectionSpec, question: st
             "limit": VECTOR_MAX_RECORDS * 2,
             "filter": {spec.company_field: company_id},
         }},
-        {"$project": {**_projection(spec), "score": {"$meta": "vectorSearchScore"}}},
+        {"$project": {**record_projection(spec), "score": {"$meta": "vectorSearchScore"}}},
     ]
     try:
-        similar = [_to_record(doc, doc["score"], spec) for doc in collection.aggregate(pipeline)]
+        similar = [to_record(doc, spec, doc["score"]) for doc in collection.aggregate(pipeline)]
     except OperationFailure as exc:
         # e.g. a just-created index is still building (INITIAL_SYNC): answer from exact matches only.
         log.warning("  Vector search unavailable on %s.%s: %s", collection.database.name, collection.name,

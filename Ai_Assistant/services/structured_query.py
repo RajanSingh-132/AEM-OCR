@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from pymongo.collection import Collection
 
@@ -43,13 +44,25 @@ class QueryResult:
 
 # ---------- conditions ----------
 
+_SEP = r"[\s\-/._]*"  # separators ignored inside identifiers: "AF-1" = "AF1" = "af 1"
+
+
 def _exact(value: str) -> dict:
     """Case-insensitive whole-value match; surrounding spaces in stored values are ignored."""
     return {"$regex": rf"^\s*{re.escape(value.strip())}\s*$", "$options": "i"}
 
 
+def _identifier_pattern(value: str) -> str:
+    """Whole-value pattern that ignores case and separators (spaces, - / . _) anywhere."""
+    chars = re.sub(r"[\s\-/._]", "", value)
+    if not chars:
+        return rf"^\s*{re.escape(value.strip())}\s*$"
+    return "^" + _SEP + _SEP.join(re.escape(c) for c in chars) + _SEP + "$"
+
+
 def exact_any(values: list[str]) -> dict:
-    return {"$in": [re.compile(rf"^\s*{re.escape(v.strip())}\s*$", re.IGNORECASE) for v in values]}
+    """Identifiers / codes: any of the values, ignoring case and separators."""
+    return {"$in": [re.compile(_identifier_pattern(v), re.IGNORECASE) for v in values]}
 
 
 def _condition(kind: str, f: Filter) -> dict:
@@ -70,6 +83,8 @@ def _condition(kind: str, f: Filter) -> dict:
         return {f.field: exact_any(f.value)}
     if f.op == "contains":
         return {f.field: {"$regex": re.escape(f.value.strip()), "$options": "i"}}
+    if kind in ("id", "code"):
+        return {f.field: exact_any([f.value])}
     return {f.field: _exact(f.value)}
 
 
@@ -101,8 +116,41 @@ def describe_conditions(filters: list[Filter]) -> str:
 
 # ---------- queries ----------
 
-def _projection(spec: CollectionSpec) -> dict:
-    return {"_id": 1, "text": f"${spec.text_field}", **{n: f"${f}" for n, f in spec.summary_fields.items()}}
+def record_projection(spec: CollectionSpec) -> dict:
+    """Fields read for each record sent to the answer LLM (+ the arrival date/time fields)."""
+    projection = {"_id": 1, "text": f"${spec.text_field}", **{n: f"${f}" for n, f in spec.summary_fields.items()}}
+    arrival = spec.sorts.get("arrival")
+    for i, (field_name, _) in enumerate(arrival.keys if arrival else ()):
+        projection[f"_arrival{i}"] = f"${field_name}"
+    return projection
+
+
+def _readable_arrival(doc: dict) -> str | None:
+    """'YYYYMMDD' + 'HHMM' -> 'Monday, October 12, 2026 at 10:18' (None if not a valid date)."""
+    try:
+        day = datetime.strptime(str(doc.get("_arrival0") or ""), "%Y%m%d")
+    except ValueError:
+        return None
+    text = f"{day:%A, %B} {day.day}, {day.year}"
+    clock = str(doc.get("_arrival1") or "").strip()
+    if clock.isdigit() and len(clock) <= 4:
+        clock = clock.zfill(4)
+        if int(clock[:2]) < 24 and int(clock[2:]) < 60:
+            text += f" at {clock[:2]}:{clock[2:]}"
+    return text
+
+
+def to_record(doc: dict, spec: CollectionSpec, score: float | None = None) -> dict:
+    """Record for the answer LLM. The arrival date is converted here, in code, so the LLM never
+    has to interpret 'YYYYMMDD' (it once read 20261012 as Dec 12 instead of Oct 12)."""
+    text = doc.get("text") or ""
+    arrival = _readable_arrival(doc)
+    if arrival:
+        text += f"\nArrival (readable, computed by the system): {arrival}"
+    record = {"id": doc["_id"], "text": text, **{n: doc.get(n) for n in spec.summary_fields}}
+    if score is not None:
+        record["score"] = score
+    return record
 
 
 def _sort_stages(spec: CollectionSpec, sort_name: str, order: str) -> list[dict]:
@@ -127,9 +175,8 @@ def fetch_records(collection: Collection, spec: CollectionSpec, match: dict,
     limit = min(limit or LIST_DEFAULT_LIMIT, QUERY_HARD_LIMIT)
     total = collection.count_documents(match)
     pipeline = [{"$match": match}, *_sort_stages(spec, sort_name, order), {"$limit": limit},
-                {"$project": _projection(spec)}]
-    records = [{"id": d["_id"], "text": d.get("text") or "", **{n: d.get(n) for n in spec.summary_fields}}
-               for d in collection.aggregate(pipeline)]
+                {"$project": record_projection(spec)}]
+    records = [to_record(d, spec) for d in collection.aggregate(pipeline)]
     order_text = "latest first" if order == "desc" else "earliest first"
     log.info("[2/3] Exact %s query: %d match(es), %d returned in %.2fs", label, total, len(records), time.perf_counter() - start)
     return QueryResult(

@@ -8,14 +8,18 @@ from datetime import date
 from Ai_Assistant.collection_mapping import OPS_BY_KIND
 
 # What the assistant is, what it may answer, and what it must refuse.
-SYSTEM_PROMPT = """You are AEM Assistant, the help assistant for ACE eManifest data in the AEM system \
-(trucking eManifests filed with U.S. Customs and Border Protection).
+SYSTEM_PROMPT = """You are AEM Assistant, the help assistant for eManifest data in the AEM system:
+ACE eManifests (U.S. Customs and Border Protection, trucks entering the United States) and ACI
+trips (CBSA, trucks entering Canada).
 
 ## Your only source of truth
 Each user message contains a QUERY RESULT that the system produced from the AEM database for
 that question: a description of the search that was run (written by the system, always
-correct) and the RECORDS, COUNT or GROUPS it returned. The user did not provide or see these
-records; refer to them as "the records I found" / "your eManifests".
+correct) and the RECORDS, COUNT or GROUPS it returned. The "Search:" line says whether the
+records are ACE eManifest records or ACI trip records; always tell the user which one ("your
+ACI trip ...", "your ACE eManifest ..."), and never mix the two. The user did not provide or
+see these records; refer to them as "the records I found". If a "Note:" line says the IDs were
+found in the other kind of records, say so briefly.
 Answer ONLY from the QUERY RESULT. Never use outside knowledge to state facts about a manifest,
 trip, carrier, driver, truck, trailer or shipment. Never guess or invent values, and never fill
 gaps with plausible-looking data. If the result does not contain the answer, say so plainly.
@@ -24,7 +28,8 @@ question refers to; take facts from the current QUERY RESULT.
 
 ## Numbers and totals (very important)
 - "Search: exact database query" or "exact count": the totals are exact for ALL of this
-  company's eManifests. State them as facts ("You have 1,477 eManifests in Draft").
+  company's records of that kind. State them as facts ("You have 1,477 ACE eManifests in
+  Draft", "You have 13 ACI trips in Sending").
   If fewer records are shown than the total, say how many you are showing out of the total
   and in which order, using the "Sorted by" line exactly (e.g. sorted by arrival date and
   time, earliest first -> "the 5 earliest arrivals of 6"; sorted by last created / modified
@@ -36,10 +41,13 @@ question refers to; take facts from the current QUERY RESULT.
 - Never compute totals yourself from the shown records when a total is given; use the total.
 
 ## You MAY answer
-- Questions about eManifests: trip numbers, status (Draft, Ready, ...), previous status,
+- Questions about ACE eManifests: trip numbers, status (Draft, Ready, ...), previous status,
   carrier and SCAC, U.S. port of arrival, arrival date and time, manifest type, message type,
   driver, truck / conveyance number, license plate, trailers, seals, version, and who
   created or modified a record and when.
+- Questions about ACI trips: trip number, SCAC, first port of arrival code (FPOA), arrival
+  date and time, trip status, truck number and plate, trailers, truck seal, trip flags, and
+  who created or modified the trip and when.
 - Lookups, filters, latest/oldest, counts, counts per status/port/carrier, comparisons and
   short summaries, based on the QUERY RESULT.
 - Greetings and "what can you do?": answer briefly and list the kinds of questions above.
@@ -81,8 +89,9 @@ question refers to; take facts from the current QUERY RESULT.
   repeat across carriers).
 - When an "Identifier" line says a value matched more than one meaning (e.g. SCAC + trip
   number, and also a stored trip number), list each matching manifest and say which is which.
-- Show dates and times readably (e.g. "Oct 5, 2026 at 06:57"). Records store dates as
-  YYYYMMDD and times as HHMM (a 3-digit time like 515 means 05:15).
+- Show dates and times readably (e.g. "Oct 5, 2026 at 06:57"). For the arrival, ALWAYS use the
+  "Arrival (readable, computed by the system)" line of the record; never convert the raw
+  YYYYMMDD value yourself.
 - NEVER use tables (no "|" columns). Use bullet points, one manifest per bullet: start with
   the SCAC + trip number in bold, then its details as short sub-bullets, e.g.
   - **8AVL 322323**
@@ -99,9 +108,9 @@ COMPANY_NOT_READY_MESSAGE = "We are working on the data for company ID {company_
 
 # Answer sent when the question does not belong to any collection (greetings land here too).
 OUT_OF_SCOPE_MESSAGE = (
-    "Hi! I can help you with questions about your eManifest records, for example a trip's status, "
-    "carrier, port of arrival, arrival time, driver, truck, trailers or seals. "
-    "Please ask me something about your eManifests. 😊"
+    "Hi! I can help you with questions about your ACE eManifests and ACI trips, for example a "
+    "trip's status, carrier, port of arrival, arrival time, driver, truck, trailers or seals. "
+    "Please ask me something about your eManifests or trips. 😊"
 )
 
 
@@ -144,8 +153,13 @@ _PLANNER_RULES = """
 2. Only add a filter for a condition the user actually asked for. Never invent conditions,
    values or IDs. Copy values as the user wrote them (fix obvious case only).
 3. For "enum" fields, the value must be one of the listed values (pick the matching one).
-4. Ports: filter USPortName with "contains" and the city name (e.g. "DETROIT"), or USPort "eq"
-   for a 4-digit code. Drivers, carriers, users: "contains" with the name the user gave.
+4. Ports: in "emanifest", filter USPortName with "contains" and the city name (e.g.
+   "DETROIT"), or USPort "eq" for a 4-digit code. In "trips", ports exist only as FPOA codes:
+   filter FPOA "eq" only when the user gives a 4-digit code (never guess a code from a city
+   name). Drivers, carriers, users: "contains" with the name the user gave.
+4b. Collections: use ONLY the fields of the collection you chose. "trip", "trips", "trip
+   details", "trip status", "ACI trip", "Canadian trip" -> "trips" (ACI). "eManifest",
+   "manifest", "ACE" -> "emanifest". If the NOTE below names a collection, use it.
 5. Dates: values are "YYYY-MM-DD". Work out relative dates ("today", "yesterday", "this week",
    "last month", "next 3 days") from TODAY. A single day: op "eq". A period: op "between"
    with [first day, last day].
@@ -188,6 +202,10 @@ Return ONLY one JSON object:
 {"collection": "emanifest", "standalone_question": "how many manifests does SCAC 8AVL have?", "intent": "count", "ids": [], "filters": [{"field": "Scac", "op": "eq", "value": "8AVL"}], "sort": null, "limit": null, "group_by": null}
 after "status of trip 45444?", the question "and who is the driver?" ->
 {"collection": "emanifest", "standalone_question": "who is the driver of trip 45444?", "intent": "lookup", "ids": ["45444"], "filters": [], "sort": null, "limit": null, "group_by": null}
+"give the trip details of AEM415254512" ->
+{"collection": "trips", "standalone_question": "give the trip details of AEM415254512", "intent": "lookup", "ids": ["AEM415254512"], "filters": [], "sort": null, "limit": null, "group_by": null}
+"how many trips are in draft?" ->
+{"collection": "trips", "standalone_question": "how many trips are in draft?", "intent": "count", "ids": [], "filters": [{"field": "TripStatusName", "op": "eq", "value": "Draft"}], "sort": null, "limit": null, "group_by": null}
 "hi" ->
 {"collection": null, "standalone_question": "hi", "intent": "semantic", "ids": [], "filters": [], "sort": null, "limit": null, "group_by": null}
 """

@@ -57,6 +57,9 @@ class CollectionSpec:
     text_field: str                 # readable text of one record (embedded; sent to the LLM)
     company_field: str              # field holding the company id (always filtered on, in code)
     id_fields: tuple[str, ...]      # identifiers looked up exactly
+    # Weaker words: they decide only when no collection's `aliases` word is in the question
+    # (e.g. "trip": every eManifest has a trip number too, so "eManifest of trip X" stays eManifest).
+    weak_aliases: tuple[str, ...] = ()
     # (code field, trip field): users often write both as one value, e.g. SCAC "19E5" + trip
     # number "TRPRPXG5S" = "19E5TRPRPXG5S" (see services/id_resolver.py).
     trip_key: tuple[str, str] | None = None
@@ -112,8 +115,8 @@ EMANIFEST_ALIASES = [
 EMANIFEST = CollectionSpec(
     name="emanifest",
     description=(
-        "ACE eManifest records (U.S. CBP truck eManifests): trips and trip numbers, filing status "
-        "(Draft, Ready, ...), carrier and SCAC, U.S. port of arrival, arrival date and time, "
+        "ACE eManifests (U.S. CBP truck eManifests, entering the United States): eManifest trip "
+        "numbers, filing status (Draft, Ready, ...), carrier and SCAC, U.S. port of arrival, arrival date and time, "
         "in-transit flag, manifest type and code, driver, truck / conveyance number, license plate, "
         "trailers, seals, shipment control and reference numbers, remarks, version, and who "
         "created or modified a record and when."
@@ -123,7 +126,7 @@ EMANIFEST = CollectionSpec(
     company_field="CompanyId",
     id_fields=("TripNum", "conveyanceNumber", "LpOne", "ShipmentControl", "ReferenceID"),
     trip_key=("Scac", "TripNum"),
-    record_label="eManifest",
+    record_label="ACE eManifest",
     query_fields={
         "TripNum": QueryField("id", "trip number, e.g. '45444', 'TRP562334'"),
         "Status": QueryField("enum", "current status of the eManifest", groupable=True),
@@ -154,7 +157,66 @@ EMANIFEST = CollectionSpec(
     filter_fields=("CompanyId", "USPort", "Status", "ArrivalDate", "TripNum", "Scac"),
 )
 
-COLLECTIONS: dict[str, CollectionSpec] = {spec.name: spec for spec in (EMANIFEST,)}
+TRIP_ALIASES = [
+    "Trip",
+    "trip",
+    "TRIP",
+    "Trips",
+    "trips",
+    "Trip details",
+    "Trip information",
+    "Trip number",
+    "Trip status",
+    "ACI Trip",
+    "ACI trip",
+    "Canadian trip",
+]
+# ACI-specific words always mean the trips collection; the plain "trip" words decide only
+# when no eManifest word is in the question.
+_TRIP_STRONG = {"aci trip", "canadian trip"}
+
+# ACI trips (Canada). Checked against 2014.trips: ports exist only as FPOA codes (port names
+# are empty), status is in TripStatusName (the Status field is empty), and driver, carrier
+# and cargo control fields are empty, so they are not offered as filters.
+TRIPS = CollectionSpec(
+    name="trips",
+    description=(
+        "ACI trips (CBSA truck trips, entering Canada): trip number, SCAC, first port of arrival "
+        "code (FPOA, 4 digits; port names are not stored), arrival date and time, trip status "
+        "(Draft, Sending, Rejected, Deleting), truck number and plate, trailers with plates, truck "
+        "seal, flags (empty truck, LVS, IIT, fly truck, postal), and who created or modified the "
+        "trip and when."
+    ),
+    aliases=tuple(a for a in TRIP_ALIASES if a.lower() in _TRIP_STRONG),
+    weak_aliases=tuple(a for a in TRIP_ALIASES if a.lower() not in _TRIP_STRONG),
+    text_field="page_content",
+    company_field="CompanyId",
+    id_fields=("TripNo", "TruckNo", "TruckPlate"),
+    trip_key=("scac", "TripNo"),
+    record_label="ACI trip",
+    query_fields={
+        "TripNo": QueryField("id", "trip number, e.g. '5465634'"),
+        "TripStatusName": QueryField("enum", "current status of the trip", groupable=True),
+        "scac": QueryField("code", "carrier SCAC code, e.g. 'AFM1', 'AF-1'", groupable=True),
+        "FPOA": QueryField("code", "first port of arrival in Canada, 4-digit code, e.g. '0318'", groupable=True),
+        "arrivalDate": QueryField("date8", "arrival date at the Canadian border", groupable=True),
+        "TruckNo": QueryField("id", "truck (unit) number"),
+        "TruckPlate": QueryField("id", "truck license plate"),
+        "Trailers": QueryField("text", "trailer numbers with plates, stored like 'AS23165 (SDA6549846)'"),
+        "CreatedModifiedByName": QueryField("text", "user who last created or modified the trip", groupable=True),
+        "CreatedModifiedOnDate": QueryField("datetime", "when the trip was last created or modified"),
+    },
+    sorts={
+        "arrival": SortSpec("arrival date and time", (("arrivalDate", "string"), ("arrivalTime", "int"))),
+        "modified": SortSpec("last created / modified time", (("CreatedModifiedOnDate", "string"),)),
+    },
+    default_sort="modified",
+    summary_fields={"trip_number": "TripNo", "status": "TripStatusName", "port": "FPOA"},
+    vector_index="trips_vector_index",
+    filter_fields=("CompanyId", "FPOA", "TripStatusName", "arrivalDate", "TripNo", "scac"),
+)
+
+COLLECTIONS: dict[str, CollectionSpec] = {spec.name: spec for spec in (EMANIFEST, TRIPS)}
 
 # Every query field must use a known kind (fails at startup, not at question time).
 for _spec in COLLECTIONS.values():
@@ -172,16 +234,23 @@ def _alias_pattern(alias: str) -> re.Pattern:
     return re.compile(rf"(?<![A-Za-z0-9]){words}(?![A-Za-z0-9])", re.IGNORECASE)
 
 
-# Longest aliases first, so the log shows the most specific match.
-_ALIAS_PATTERNS = sorted(
-    {(alias.lower(), spec.name) for spec in COLLECTIONS.values() for alias in spec.aliases},
-    key=lambda item: -len(item[0]),
-)
-_ALIAS_PATTERNS = [(alias, name, _alias_pattern(alias)) for alias, name in _ALIAS_PATTERNS]
+def _patterns(attr: str) -> list[tuple[str, str, re.Pattern]]:
+    # Longest aliases first, so the log shows the most specific match.
+    pairs = sorted({(a.lower(), spec.name) for spec in COLLECTIONS.values() for a in getattr(spec, attr)},
+                   key=lambda item: -len(item[0]))
+    return [(alias, name, _alias_pattern(alias)) for alias, name in pairs]
+
+
+# Strong aliases of every collection are checked before any weak alias.
+_ALIAS_PATTERNS = _patterns("aliases") + _patterns("weak_aliases")
 
 
 def match_by_keywords(question: str) -> tuple[CollectionSpec, str] | None:
-    """(collection, matched alias) when an alias appears in the question, else None."""
+    """(collection, matched alias) when an alias appears in the question, else None.
+
+    Priority: strong aliases ("ACI trip", "emanifest", "manifest", ...) of any collection,
+    then weak aliases ("trip", "trip details", ...).
+    """
     for alias, name, pattern in _ALIAS_PATTERNS:
         if pattern.search(question):
             return COLLECTIONS[name], alias
