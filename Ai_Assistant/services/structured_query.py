@@ -17,6 +17,7 @@ from Ai_Assistant.collection_mapping import CollectionSpec
 from Ai_Assistant.config import (
     ENUM_VALUES_CACHE_SECONDS,
     GROUP_MAX_ROWS,
+    HIDDEN_RECORD_FIELDS,
     LIST_DEFAULT_LIMIT,
     QUERY_HARD_LIMIT,
 )
@@ -140,10 +141,22 @@ def _readable_arrival(doc: dict) -> str | None:
     return text
 
 
+_HIDDEN = {name.lower() for name in HIDDEN_RECORD_FIELDS}
+
+
+def _strip_hidden(text: str) -> str:
+    """Drop "Field: value" lines of internal fields (record Id, CompanyId, Version, ...)."""
+    return "\n".join(
+        line for line in text.splitlines()
+        if line.split(":", 1)[0].strip().lower() not in _HIDDEN
+    )
+
+
 def to_record(doc: dict, spec: CollectionSpec, score: float | None = None) -> dict:
-    """Record for the answer LLM. The arrival date is converted here, in code, so the LLM never
-    has to interpret 'YYYYMMDD' (it once read 20261012 as Dec 12 instead of Oct 12)."""
-    text = doc.get("text") or ""
+    """Record for the answer LLM. Internal fields are removed, and the arrival date is converted
+    here, in code, so the LLM never has to interpret 'YYYYMMDD' (it once read 20261012 as
+    Dec 12 instead of Oct 12)."""
+    text = _strip_hidden(doc.get("text") or "")
     arrival = _readable_arrival(doc)
     if arrival:
         text += f"\nArrival (readable, computed by the system): {arrival}"

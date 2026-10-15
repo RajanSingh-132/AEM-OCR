@@ -46,6 +46,12 @@ VECTOR_MIN_SCORE = 0.58       # similarity search: drop records less similar tha
 VECTOR_SCORE_WINDOW = 0.06    # similarity search: keep only records this close to the best match
 VECTOR_MAX_RECORDS = 10       # similarity search: at most this many records
 CHAT_NUM_CANDIDATES = 200     # vector search candidates (higher = better recall, slower)
+# Internal fields removed from every record before it reaches the answer LLM, so they can never
+# appear in a response (compared case-insensitively). They can still be used for lookups.
+HIDDEN_RECORD_FIELDS = (
+    "Id", "CompanyId", "Version", "ReferenceID", "AmendmentCode", "AmendmentTypeCode", "amendcode",
+    "AceID", "AciID", "TruckId",
+)
 ENUM_VALUES_CACHE_SECONDS = 600  # allowed values of "enum" fields are read from the data, cached this long
 CHAT_MAX_QUESTION_CHARS = 2000
 CHAT_MAX_ANSWER_TOKENS = 4096
