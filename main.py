@@ -6,7 +6,7 @@ Run:
     uvicorn main:app --reload
     # or
     python main.py
-
+    python -m pip list
 Docs: http://127.0.0.1:8000/docs
 """
 

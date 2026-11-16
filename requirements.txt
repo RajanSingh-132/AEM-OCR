@@ -18,5 +18,8 @@ google-genai>=1.0.0            # fallback
 pymongo>=4.7.0                 # MongoDB Atlas + vector search index
 boto3>=1.34.0                  # AWS Bedrock (Titan Text Embeddings V2, 1024-d)
 
+# ---------- Live sync (AEM API -> MongoDB) ----------
+httpx>=0.27.0                  # AEM API client
+
 # ---------- Tests ----------
 pytest>=8.0.0
