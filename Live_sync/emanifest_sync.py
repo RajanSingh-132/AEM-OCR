@@ -55,6 +55,7 @@ from Ai_Assistant.collection_mapping import EMANIFEST
 from Ai_Assistant.config import EMBEDDING_WORKERS, company_db_name
 from Ai_Assistant.services.embeddings import embed_text
 from Ai_Assistant.services.mongo_client import ensure_vector_index_once, get_collection, ping
+from Live_sync.alerts import Alerter
 from Script_ingest.ingest_emanifest import build_document, build_page_content, clean_record
 
 load_dotenv()
@@ -167,7 +168,7 @@ def _embed(item: tuple[dict, str]) -> tuple[dict, str, list[float] | None]:
     try:
         return fields, text, embed_text(text)
     except Exception as exc:
-        log.error("  Embedding failed for eManifest Id %s: %s", fields.get("Id"), exc)
+        log.error("  Embedding failed for company %s eManifest Id %s: %s", fields.get("CompanyId"), fields.get("Id"), exc)
         return fields, text, None
 
 
@@ -298,21 +299,32 @@ def main() -> None:
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), _request_stop)
 
-    ping()
-    if args.once:
+    if args.once:  # manual test run: no alert emails
+        ping()
         run_cycle(company_ids, args.full)
         return
 
-    log.info("eManifest live sync running every %ds for companies %s",
-             SYNC_INTERVAL_SECONDS, ", ".join(map(str, company_ids)))
-    while not _stop.is_set():
-        started = time.monotonic()
-        try:
-            run_cycle(company_ids, args.full)
-        except Exception as exc:  # never let one bad cycle kill the service
-            log.exception("Sync cycle crashed: %s", exc)
-        _stop.wait(max(0.0, SYNC_INTERVAL_SECONDS - (time.monotonic() - started)))
+    alerter = Alerter("AEM eManifest Sync", LOG_FILE)
+    logging.getLogger().addHandler(alerter)
+    alerter.service_started(company_ids)
+    try:
+        ping()
+        log.info("eManifest live sync running every %ds for companies %s",
+                 SYNC_INTERVAL_SECONDS, ", ".join(map(str, company_ids)))
+        while not _stop.is_set():
+            started = time.monotonic()
+            try:
+                run_cycle(company_ids, args.full)
+            except Exception as exc:  # never let one bad cycle kill the service
+                log.exception("Sync cycle crashed: %s", exc)
+            alerter.end_cycle()
+            _stop.wait(max(0.0, SYNC_INTERVAL_SECONDS - (time.monotonic() - started)))
+    except BaseException as exc:
+        log.exception("eManifest live sync crashed: %s", exc)
+        alerter.service_stopped(f"crashed: {type(exc).__name__}: {exc}", crashed=True)
+        raise
     log.info("eManifest live sync stopped")
+    alerter.service_stopped("stop requested (service stop / Ctrl+C)")
 
 
 if __name__ == "__main__":
