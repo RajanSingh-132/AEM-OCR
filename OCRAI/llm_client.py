@@ -1,6 +1,6 @@
 """The LLMs used for vision OCR, structured extraction and the AEM chat assistant.
 
-    OCR / extraction:                      Groq -> Gemini
+    OCR / extraction (/upload/pdf_dynamic_extract): Claude -> Gemini   (Claude only if ANTHROPIC_API_KEY + LLM_MODEL are set)
     AEM chat (/api/v1/chat: planner+answer): xAI Groq -> Groq -> Gemini   (Groq only if XAI_API_KEY is set)
 
 Every call goes to each provider in that order once, until one succeeds. If all fail,
@@ -15,19 +15,22 @@ import base64
 import logging
 import time
 
+import anthropic
 import httpx
 from google import genai
 from google.genai import types
 from groq import Groq
 
 from OCRAI.config import (
+    ANTHROPIC_API_KEY,
+    CLAUDE_MODEL,
+    CLAUDE_TIMEOUT_SECONDS,
     GEMINI_API_KEY,
     GEMINI_MODEL,
     GEMINI_THINKING_BUDGET,
     GEMINI_VISION_MODEL,
     GROQ_API_KEY,
     GROQ_MODEL,
-    GROQ_VISION_MODEL,
     MAX_OUTPUT_TOKENS,
     XAI_API_KEY,
     XAI_BASE_URL,
@@ -59,6 +62,12 @@ _xai = httpx.Client(
 ) if XAI_API_KEY and XAI_MODEL and XAI_BASE_URL else None
 if _xai is None:
     log.warning("XAI_API_KEY / XAI_MODEL / XAI_BASE_URL not set: the chat assistant uses Groq -> Gemini")
+# Claude: no SDK retries, so a failure falls through to Gemini at once (like the other clients).
+_claude = anthropic.Anthropic(
+    api_key=ANTHROPIC_API_KEY, max_retries=0, timeout=CLAUDE_TIMEOUT_SECONDS,
+) if ANTHROPIC_API_KEY and CLAUDE_MODEL else None
+if _claude is None:
+    log.warning("ANTHROPIC_API_KEY / LLM_MODEL not set: document extraction uses Gemini only")
 
 
 class LLMError(RuntimeError):
@@ -103,6 +112,28 @@ def _groq_generate(model: str, messages: list, label: str, **kwargs) -> str:
     if choice.finish_reason == "length":
         raise LLMError("reply was cut off at the output token limit")
     return choice.message.content or ""
+
+
+# ---------- Claude (extraction primary) ----------
+
+def _claude_generate(content: list, label: str, max_tokens: int = MAX_OUTPUT_TOKENS) -> str:
+    """One Claude call. Streams so a large max_tokens never hits the SDK's HTTP timeout guard."""
+    start = time.perf_counter()
+    with _claude.messages.stream(
+        model=CLAUDE_MODEL, max_tokens=max_tokens, messages=[{"role": "user", "content": content}],
+    ) as stream:
+        message = stream.get_final_message()
+    usage = message.usage
+    log.info(
+        "    LLM %s [Claude %s]: %.2fs | tokens in %s, out %s | stop %s",
+        label, CLAUDE_MODEL, time.perf_counter() - start,
+        getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None), message.stop_reason,
+    )
+    if message.stop_reason == "max_tokens":
+        raise LLMError("reply was cut off at the output token limit")
+    if message.stop_reason == "refusal":
+        raise LLMError("the model declined the request")
+    return "".join(block.text for block in message.content if block.type == "text")
 
 
 # ---------- Gemini (fallback) ----------
@@ -151,20 +182,28 @@ def _first_success(label: str, attempts: list[tuple[str, str, object]]) -> str:
 
 
 def generate_json(prompt: str, for_chat: bool = False) -> str:
-    """Structured extraction: prompt in, raw JSON text out. for_chat=True (chat planner) tries Groq first."""
+    """Prompt in, raw JSON text out.
+
+    Document extraction (default): Claude -> Gemini.
+    Chat planner (for_chat=True):  Groq (xAI) -> Groq -> Gemini.
+    """
     attempts = []
-    if for_chat and _xai is not None:
-        attempts.append(("primary", "Groq", lambda: _xai_generate(
-            [{"role": "user", "content": prompt}], "chat planner", MAX_OUTPUT_TOKENS, json_mode=True,
-        )))
-    if _groq is not None:
-        attempts.append(("fallback" if attempts else "primary", "Groq", lambda: _groq_generate(
-            GROQ_MODEL, [{"role": "user", "content": prompt}], "extraction",
-            response_format={"type": "json_object"}, max_completion_tokens=MAX_OUTPUT_TOKENS,
-        )))
+    label = "chat planner" if for_chat else "extraction"
+    if for_chat:
+        if _xai is not None:
+            attempts.append(("primary", "Groq", lambda: _xai_generate(
+                [{"role": "user", "content": prompt}], label, MAX_OUTPUT_TOKENS, json_mode=True,
+            )))
+        if _groq is not None:
+            attempts.append(("fallback" if attempts else "primary", "Groq", lambda: _groq_generate(
+                GROQ_MODEL, [{"role": "user", "content": prompt}], label,
+                response_format={"type": "json_object"}, max_completion_tokens=MAX_OUTPUT_TOKENS,
+            )))
+    elif _claude is not None:
+        attempts.append(("primary", "Claude", lambda: _claude_generate([{"type": "text", "text": prompt}], label)))
     config = _gemini_config(max_output_tokens=MAX_OUTPUT_TOKENS, response_mime_type="application/json")
-    attempts.append(("fallback", "Gemini", lambda: _gemini_generate(GEMINI_MODEL, prompt, config, "extraction")))
-    return _first_success("extraction", attempts)
+    attempts.append(("fallback", "Gemini", lambda: _gemini_generate(GEMINI_MODEL, prompt, config, label)))
+    return _first_success(label, attempts)
 
 
 def generate_text(system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str:
@@ -183,15 +222,17 @@ def generate_text(system_prompt: str, user_prompt: str, max_tokens: int = 4096) 
 
 
 def generate_from_image(instruction: str, image_bytes: bytes, mime_type: str) -> str:
-    """Vision OCR: one message with the instruction and the image."""
+    """Vision OCR: one message with the image and the instruction. Claude -> Gemini."""
     attempts = []
-    if _groq is not None:
-        data_url = f"data:{mime_type};base64,{base64.b64encode(image_bytes).decode()}"
-        messages = [{"role": "user", "content": [
+    if _claude is not None:
+        content = [
+            {"type": "image", "source": {
+                "type": "base64", "media_type": mime_type,
+                "data": base64.standard_b64encode(image_bytes).decode("utf-8"),
+            }},
             {"type": "text", "text": instruction},
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ]}]
-        attempts.append(("primary", "Groq", lambda: _groq_generate(GROQ_VISION_MODEL, messages, "vision OCR")))
+        ]
+        attempts.append(("primary", "Claude", lambda: _claude_generate(content, "vision OCR", max_tokens=16_000)))
     contents = [instruction, types.Part.from_bytes(data=image_bytes, mime_type=mime_type)]
     attempts.append(("fallback", "Gemini", lambda: _gemini_generate(
         GEMINI_VISION_MODEL, contents, _gemini_config(), "vision OCR"

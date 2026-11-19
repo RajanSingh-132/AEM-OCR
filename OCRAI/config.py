@@ -19,6 +19,12 @@ XAI_MODEL = os.getenv("XAI_MODEL", "").strip()
 XAI_BASE_URL = os.getenv("XAI_BASE_URL", "").strip()
 XAI_TIMEOUT_SECONDS = float(os.getenv("XAI_TIMEOUT_SECONDS", "").strip() or 60)
 
+# Claude (Anthropic): primary LLM for PDF / image / Word extraction (vision OCR + JSON); Gemini is its fallback.
+# Optional: without a key, extraction uses Gemini only.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+CLAUDE_MODEL = os.getenv("LLM_MODEL", "").strip()
+CLAUDE_TIMEOUT_SECONDS = float(os.getenv("CLAUDE_TIMEOUT_SECONDS", "").strip() or 300)
+
 # Fallback LLM (used when the primary fails).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
