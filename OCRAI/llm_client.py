@@ -1,7 +1,10 @@
-"""The LLMs used for vision OCR and structured extraction: Groq first, Gemini as fallback.
+"""The LLMs used for vision OCR, structured extraction and the AEM chat assistant.
 
-Every call goes to the primary (Groq) once; if that fails, it goes to the fallback (Gemini)
-once. If both fail, LLMError is raised. There are no retries.
+    OCR / extraction:                      Groq -> Gemini
+    AEM chat (/api/v1/chat: planner+answer): xAI Groq -> Groq -> Gemini   (Groq only if XAI_API_KEY is set)
+
+Every call goes to each provider in that order once, until one succeeds. If all fail,
+LLMError is raised. There are no retries.
 
 Clients are created once at import. Calls are synchronous because the pipeline runs in a
 worker thread. LLMError messages are vendor-neutral ("primary" / "fallback"); the full
@@ -12,6 +15,7 @@ import base64
 import logging
 import time
 
+import httpx
 from google import genai
 from google.genai import types
 from groq import Groq
@@ -25,6 +29,10 @@ from OCRAI.config import (
     GROQ_MODEL,
     GROQ_VISION_MODEL,
     MAX_OUTPUT_TOKENS,
+    XAI_API_KEY,
+    XAI_BASE_URL,
+    XAI_MODEL,
+    XAI_TIMEOUT_SECONDS,
 )
 
 log = logging.getLogger(__name__)
@@ -44,10 +52,40 @@ _gemini = genai.Client(
 )
 if _groq is None:
     log.warning("GROQ_API_KEY not set: using Gemini only")
+# xAI's API is OpenAI-compatible; plain HTTP, no extra SDK.
+_xai = httpx.Client(
+    base_url=XAI_BASE_URL, timeout=XAI_TIMEOUT_SECONDS,
+    headers={"Authorization": f"Bearer {XAI_API_KEY}"},
+) if XAI_API_KEY and XAI_MODEL and XAI_BASE_URL else None
+if _xai is None:
+    log.warning("XAI_API_KEY / XAI_MODEL / XAI_BASE_URL not set: the chat assistant uses Groq -> Gemini")
 
 
 class LLMError(RuntimeError):
     pass
+
+
+# ---------- xAI Groq (chat primary) ----------
+
+def _xai_generate(messages: list, label: str, max_tokens: int, json_mode: bool = False) -> str:
+    start = time.perf_counter()
+    body = {"model": XAI_MODEL, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    response = _xai.post("/chat/completions", json=body)
+    if response.status_code != 200:
+        raise LLMError(f"HTTP {response.status_code}: {response.text[:300]}")
+    data = response.json()
+    choice = data["choices"][0]
+    usage = data.get("usage") or {}
+    log.info(
+        "    LLM %s [Groq %s]: %.2fs | tokens in %s, out %s | finish %s",
+        label, XAI_MODEL, time.perf_counter() - start,
+        usage.get("prompt_tokens"), usage.get("completion_tokens"), choice.get("finish_reason"),
+    )
+    if choice.get("finish_reason") == "length":
+        raise LLMError("reply was cut off at the output token limit")
+    return choice["message"].get("content") or ""
 
 
 # ---------- Groq (primary) ----------
@@ -112,11 +150,15 @@ def _first_success(label: str, attempts: list[tuple[str, str, object]]) -> str:
     raise LLMError(f"LLM request failed ({'; '.join(failures)}).")
 
 
-def generate_json(prompt: str) -> str:
-    """Structured extraction: prompt in, raw JSON text out."""
+def generate_json(prompt: str, for_chat: bool = False) -> str:
+    """Structured extraction: prompt in, raw JSON text out. for_chat=True (chat planner) tries Groq first."""
     attempts = []
+    if for_chat and _xai is not None:
+        attempts.append(("primary", "Groq", lambda: _xai_generate(
+            [{"role": "user", "content": prompt}], "chat planner", MAX_OUTPUT_TOKENS, json_mode=True,
+        )))
     if _groq is not None:
-        attempts.append(("primary", "Groq", lambda: _groq_generate(
+        attempts.append(("fallback" if attempts else "primary", "Groq", lambda: _groq_generate(
             GROQ_MODEL, [{"role": "user", "content": prompt}], "extraction",
             response_format={"type": "json_object"}, max_completion_tokens=MAX_OUTPUT_TOKENS,
         )))
@@ -126,11 +168,13 @@ def generate_json(prompt: str) -> str:
 
 
 def generate_text(system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> str:
-    """Chat answer: system prompt + user message in, plain text out."""
+    """Chat answer: system prompt + user message in, plain text out. Groq -> Groq -> Gemini."""
     attempts = []
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    if _xai is not None:
+        attempts.append(("primary", "Groq", lambda: _xai_generate(messages, "chat", max_tokens)))
     if _groq is not None:
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-        attempts.append(("primary", "Groq", lambda: _groq_generate(
+        attempts.append(("fallback" if attempts else "primary", "Groq", lambda: _groq_generate(
             GROQ_MODEL, messages, "chat", max_completion_tokens=max_tokens,
         )))
     config = _gemini_config(system_instruction=system_prompt, max_output_tokens=max_tokens)

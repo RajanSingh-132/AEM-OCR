@@ -177,7 +177,7 @@ def plan_question(question: str, history: str, company_id: int) -> Plan:
                                   keyword_spec.name if keyword_spec else None)
     start = time.perf_counter()
     try:
-        raw = parse_llm_json(llm_client.generate_json(prompt))
+        raw = parse_llm_json(llm_client.generate_json(prompt, for_chat=True))
     except llm_client.LLMError:
         spec = keyword_spec or _single_collection()
         if spec is None:

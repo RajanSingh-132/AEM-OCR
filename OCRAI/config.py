@@ -12,6 +12,13 @@ GROQ_MODEL = os.getenv("GROQ_MODEL")
 # Must accept images (gpt-oss models do not).
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL")
 
+# xAI Groq: primary LLM for the AEM chat assistant only (POST /api/v1/chat); Groq is its fallback.
+# Optional: without a key, the chat uses Groq -> Gemini as before.
+XAI_API_KEY = os.getenv("XAI_API_KEY", "").strip()
+XAI_MODEL = os.getenv("XAI_MODEL", "").strip()
+XAI_BASE_URL = os.getenv("XAI_BASE_URL", "").strip()
+XAI_TIMEOUT_SECONDS = float(os.getenv("XAI_TIMEOUT_SECONDS", "").strip() or 60)
+
 # Fallback LLM (used when the primary fails).
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL")
