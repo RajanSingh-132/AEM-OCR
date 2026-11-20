@@ -1,7 +1,15 @@
 """Which MongoDB collection a question is about, and how that collection is laid out.
 
 A question is mapped to a collection by:
-  1. keyword match: one of the collection's aliases appears in the question (always wins)
+  1. keyword match: one of the collection's aliases appears in the question (always wins).
+     Program words come first, in three levels (a level that points to both collections is
+     skipped, so the next one decides), then the record words:
+       a. program:   ACE / ACEs / PAPS -> emanifest;  ACI / ACIs / PARS -> trips
+       b. direction: into / to / entering / towards USA, USA-bound, from Canada -> emanifest;
+                     into / to / entering / towards Canada, Canada-bound, from USA -> trips
+       c. country:   USA / US / America / American / CBP -> emanifest;
+                     Canada / Canadian / CBSA -> trips
+     So "ACE trips" -> emanifest and "ACI eManifest" -> trips, whatever record word follows.
   2. otherwise the query planner (ONE LLM call, services/query_planner.py) decides from the
      descriptions below whether the question belongs to a collection (or to none)
 
@@ -60,6 +68,12 @@ class CollectionSpec:
     # Weaker words: they decide only when no collection's `aliases` word is in the question
     # (e.g. "trip": every eManifest has a trip number too, so "eManifest of trip X" stays eManifest).
     weak_aliases: tuple[str, ...] = ()
+    # Program words, checked before every other alias (see the module docstring), in order:
+    # program names (ACE, PARS, ...), direction ("into USA", "from Canada", ...), country /
+    # agency ("Canadian", "CBP", ...). So "ACE trips" -> emanifest, "ACI eManifest" -> trips.
+    program_aliases: tuple[str, ...] = ()
+    direction_aliases: tuple[str, ...] = ()
+    country_aliases: tuple[str, ...] = ()
     # (code field, trip field): users often write both as one value, e.g. SCAC "19E5" + trip
     # number "TRPRPXG5S" = "19E5TRPRPXG5S" (see services/id_resolver.py).
     trip_key: tuple[str, str] | None = None
@@ -112,6 +126,24 @@ EMANIFEST_ALIASES = [
     "emanifest module",
 ]
 
+# ---------- program words (ACE = into the USA, ACI = into Canada) ----------
+# "US" in capitals only ("show us trips" is English, "show US trips" is the country): any
+# alias with the word "US" is matched case-sensitively (see _alias_pattern).
+_US_NAMES = ("USA", "U.S.A", "US", "U.S", "United States", "America")
+_CANADA_NAMES = ("Canada",)
+_TOWARDS = ("into", "to", "entering", "toward", "towards", "bound for")
+
+
+def _direction(to_names, from_names) -> tuple[str, ...]:
+    """'into USA', 'to the USA', 'USA-bound', ... for to_names; 'from Canada', ... for from_names."""
+    words = []
+    for name in to_names:
+        words += [f"{verb} {the}{name}" for verb in _TOWARDS for the in ("", "the ")]
+        words += [f"{name}-bound", f"{name} bound", f"{name}bound"]
+    for name in from_names:
+        words += [f"from {the}{name}" for the in ("", "the ")]
+    return tuple(words)
+
 EMANIFEST = CollectionSpec(
     name="emanifest",
     description=(
@@ -122,6 +154,9 @@ EMANIFEST = CollectionSpec(
         "created or modified a record and when."
     ),
     aliases=tuple(EMANIFEST_ALIASES),
+    program_aliases=("ACE", "ACEs", "PAPS"),
+    direction_aliases=_direction(_US_NAMES, _CANADA_NAMES),  # into the USA / from Canada
+    country_aliases=_US_NAMES + ("American", "CBP"),
     text_field="page_content",
     company_field="CompanyId",
     id_fields=("TripNum", "conveyanceNumber", "LpOne", "ShipmentControl", "ReferenceID"),
@@ -189,6 +224,9 @@ TRIPS = CollectionSpec(
     ),
     aliases=tuple(a for a in TRIP_ALIASES if a.lower() in _TRIP_STRONG),
     weak_aliases=tuple(a for a in TRIP_ALIASES if a.lower() not in _TRIP_STRONG),
+    program_aliases=("ACI", "ACIs", "PARS"),
+    direction_aliases=_direction(_CANADA_NAMES, _US_NAMES),  # into Canada / from the USA
+    country_aliases=_CANADA_NAMES + ("Canadian", "CBSA"),
     text_field="page_content",
     company_field="CompanyId",
     id_fields=("TripNo", "TruckNo", "TruckPlate"),
@@ -227,30 +265,49 @@ for _spec in COLLECTIONS.values():
         raise ValueError(f"{_spec.name}: default_sort '{_spec.default_sort}' is not in sorts")
 
 
+def _case_sensitive(alias: str) -> bool:
+    # "US" is the country only in capitals; "us" is English ("show us", "send to us").
+    return "US" in alias.split()
+
+
 def _alias_pattern(alias: str) -> re.Pattern:
-    # Case-insensitive, whole words only ("manifest" must not match inside "manifestation"),
-    # and any spacing between words ("e  manifest").
-    words = r"\s+".join(re.escape(word) for word in alias.split())
-    return re.compile(rf"(?<![A-Za-z0-9]){words}(?![A-Za-z0-9])", re.IGNORECASE)
+    # Whole words only ("manifest" must not match inside "manifestation", "ACE" not inside
+    # "place"), any spacing between words ("e  manifest"), "-" or space in "USA-bound".
+    # Case-insensitive, except aliases with the word "US".
+    words = r"\s+".join(re.escape(word) for word in alias.split()).replace(r"\-", r"[-\s]?")
+    flags = 0 if _case_sensitive(alias) else re.IGNORECASE
+    return re.compile(rf"(?<![A-Za-z0-9]){words}(?![A-Za-z0-9])", flags)
 
 
 def _patterns(attr: str) -> list[tuple[str, str, re.Pattern]]:
-    # Longest aliases first, so the log shows the most specific match.
-    pairs = sorted({(a.lower(), spec.name) for spec in COLLECTIONS.values() for a in getattr(spec, attr)},
-                   key=lambda item: -len(item[0]))
-    return [(alias, name, _alias_pattern(alias)) for alias, name in pairs]
+    # One pattern per alias (case variants merged); longest first, so the log shows the most
+    # specific match.
+    pairs = {(a if _case_sensitive(a) else a.lower(), spec.name)
+             for spec in COLLECTIONS.values() for a in getattr(spec, attr)}
+    return [(alias, name, _alias_pattern(alias)) for alias, name in sorted(pairs, key=lambda p: -len(p[0]))]
 
 
-# Strong aliases of every collection are checked before any weak alias.
+# Program words (three levels), then strong aliases of every collection, then weak aliases.
+_PROGRAM_LEVELS = [_patterns("program_aliases"), _patterns("direction_aliases"), _patterns("country_aliases")]
 _ALIAS_PATTERNS = _patterns("aliases") + _patterns("weak_aliases")
 
 
 def match_by_keywords(question: str) -> tuple[CollectionSpec, str] | None:
     """(collection, matched alias) when an alias appears in the question, else None.
 
-    Priority: strong aliases ("ACI trip", "emanifest", "manifest", ...) of any collection,
-    then weak aliases ("trip", "trip details", ...).
+    Priority: program words in three levels (program name, direction, country / agency; see
+    the module docstring), then strong aliases ("ACI trip", "emanifest", "manifest", ...),
+    then weak aliases ("trip", ...). A level whose words point to both collections ("ACE and
+    ACI") does not decide; the next level does.
     """
+    for level in _PROGRAM_LEVELS:
+        hits = {}
+        for alias, name, pattern in level:
+            if name not in hits and pattern.search(question):
+                hits[name] = alias
+        if len(hits) == 1:
+            name, alias = next(iter(hits.items()))
+            return COLLECTIONS[name], alias
     for alias, name, pattern in _ALIAS_PATTERNS:
         if pattern.search(question):
             return COLLECTIONS[name], alias

@@ -162,9 +162,15 @@ _PLANNER_RULES = """
    "DETROIT"), or USPort "eq" for a 4-digit code. In "trips", ports exist only as FPOA codes:
    filter FPOA "eq" only when the user gives a 4-digit code (never guess a code from a city
    name). Drivers, carriers, users: "contains" with the name the user gave.
-4b. Collections: use ONLY the fields of the collection you chose. "trip", "trips", "trip
-   details", "trip status", "ACI trip", "Canadian trip" -> "trips" (ACI). "eManifest",
-   "manifest", "ACE" -> "emanifest". If the NOTE below names a collection, use it.
+4b. Collections: use ONLY the fields of the collection you chose. The program decides
+   first, whatever record word follows (trip, manifest, shipment, record, data):
+   - "emanifest" (ACE, into the United States): "ACE", "PAPS", "into / to / entering USA",
+     "USA-bound", "from Canada", "US", "American", "CBP".
+   - "trips" (ACI, into Canada): "ACI", "PARS", "into / to / entering Canada",
+     "Canada-bound", "from USA", "Canadian", "CBSA".
+   So "ACE trip" -> "emanifest" and "ACI eManifest" -> "trips". Without a program word:
+   "eManifest", "manifest" -> "emanifest"; "trip", "trips", "trip details", "trip status" ->
+   "trips". If the NOTE below names a collection, use it.
 5. Dates: values are "YYYY-MM-DD". Work out relative dates ("today", "yesterday", "this week",
    "last month", "next 3 days") from TODAY. A single day: op "eq". A period: op "between"
    with [first day, last day].
@@ -197,8 +203,8 @@ Return ONLY one JSON object:
 {"collection": "emanifest", "standalone_question": "how many manifests are in draft?", "intent": "count", "ids": [], "filters": [{"field": "Status", "op": "eq", "value": "Draft"}], "sort": null, "limit": null, "group_by": null}
 "show the 2 most recent emanifests" ->
 {"collection": "emanifest", "standalone_question": "show the 2 most recent emanifests", "intent": "list", "ids": [], "filters": [], "sort": {"by": "modified", "order": "desc"}, "limit": 2, "group_by": null}
-"which trips arrive at Detroit this week?" ->
-{"collection": "emanifest", "standalone_question": "which trips arrive at Detroit this week?", "intent": "list", "ids": [], "filters": [{"field": "USPortName", "op": "contains", "value": "DETROIT"}, {"field": "ArrivalDate", "op": "between", "value": ["2026-10-12", "2026-10-18"]}], "sort": {"by": "arrival", "order": "asc"}, "limit": null, "group_by": null}
+"which ACE trips arrive at Detroit this week?" ->
+{"collection": "emanifest", "standalone_question": "which ACE trips arrive at Detroit this week?", "intent": "list", "ids": [], "filters": [{"field": "USPortName", "op": "contains", "value": "DETROIT"}, {"field": "ArrivalDate", "op": "between", "value": ["2026-10-12", "2026-10-18"]}], "sort": {"by": "arrival", "order": "asc"}, "limit": null, "group_by": null}
 "count manifests per status" ->
 {"collection": "emanifest", "standalone_question": "count manifests per status", "intent": "count", "ids": [], "filters": [], "sort": null, "limit": null, "group_by": "Status"}
 "19E5TRPRPXG5S emanifest details" ->
