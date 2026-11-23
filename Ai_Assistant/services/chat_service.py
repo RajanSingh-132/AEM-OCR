@@ -9,10 +9,11 @@ How many records reach the answer LLM depends on the question:
 """
 
 import logging
+import re
 import time
 from dataclasses import replace
 
-from Ai_Assistant.collection_mapping import COLLECTIONS
+from Ai_Assistant.collection_mapping import COLLECTIONS, clear_collection, named_programs, needs_program_choice
 from Ai_Assistant.config import (
     CHAT_HISTORY_ANSWER_CHARS,
     CHAT_MAX_ANSWER_TOKENS,
@@ -22,7 +23,11 @@ from Ai_Assistant.config import (
 from Ai_Assistant.prompts import (
     COMPANY_NOT_READY_MESSAGE,
     OUT_OF_SCOPE_MESSAGE,
+    PROGRAM_CHOICE_MESSAGE,
+    PROGRAM_CHOICE_RETRY_MESSAGE,
+    PROGRAM_CHOICE_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    build_program_choice_prompt,
     build_user_prompt,
     format_history,
 )
@@ -52,9 +57,103 @@ _NOTHING = {"_id": {"$in": []}}  # matches no document (identifiers that resolve
 def answer_question(question: str, company_id: int, session_id: str | None = None) -> dict:
     """Returns {"answer": str, "session_id": str}. Raises LLMError or database errors."""
     session_id, turns = start_session(session_id, company_id)
+    last = turns[-1] if turns else {}
+    pending = last.get("pending_question")    # we asked "ACE or ACI?" for this question
+    answered = last.get("program_question")   # we just answered this question for ACE / ACI / both
+    program_question = None
+    if pending and len(question.split()) <= _CHOICE_REPLY_MAX_WORDS:
+        # Reply to "ACE or ACI?": ACE / ACI / Both continue the waiting question; anything
+        # unclear ("trip", "ok") is asked again.
+        choice = _program_choice(question)
+        if choice is None:
+            log.info("  Reply '%s' does not say ACE or ACI -> asking again", question)
+            return _ask_program(pending, question, session_id, retry=True)
+        program_question = pending
+    elif answered and _is_program_switch(question):
+        # Follow-up after that answer: "and ACI?", "both for?", "what about ACE" -> same
+        # question for that program. Anything else is a new question.
+        choice = _program_choice(question)
+        program_question = answered
+    if program_question:
+        if choice == "both":
+            return _answer_for_both(program_question, turns, company_id, session_id)
+        question = f"{program_question} (for {choice.record_label}s)"
+        log.info("  Reply -> '%s'", question)
+    if needs_program_choice(question):
+        # Status question without ACE / ACI: ask instead of guessing.
+        log.info("  Status question without ACE / ACI -> asking which one")
+        return _ask_program(question, question, session_id, retry=False)
     plan = plan_question(question, format_history(turns, PLANNER_HISTORY_ANSWER_CHARS), company_id)
     answer = _answer(question, plan, format_history(turns, CHAT_HISTORY_ANSWER_CHARS), company_id)
-    save_turn(session_id, question, plan.standalone_question, answer)
+    save_turn(session_id, question, plan.standalone_question, answer, program_question=program_question)
+    return {"answer": answer, "session_id": session_id}
+
+
+_CHOICE_REPLY_MAX_WORDS = 4  # "ACE", "for ACI", "eManifest please"; longer = a new question
+_BOTH_WORDS = re.compile(r"(?<![A-Za-z])(both|all|dono|donon|donno)(?![A-Za-z])", re.IGNORECASE)
+
+
+def _program_choice(reply: str):
+    """Reply to "ACE or ACI?": "both", the collection it names clearly (ACE / PAPS / USA /
+    eManifest -> emanifest, ACI / PARS / Canada -> trips), or None ("trip", "ok", ...)."""
+    if _BOTH_WORDS.search(reply) or len(named_programs(reply)) == 2:
+        return "both"
+    return clear_collection(reply)
+
+
+# Words that may surround the program in a follow-up ("and what about ACI trips?", "ACI ke liye").
+_SWITCH_FILLERS = {
+    "and", "for", "what", "about", "how", "the", "then", "also", "please", "pls", "now", "same",
+    "again", "too", "of", "in", "same", "one", "side", "trip", "trips", "record", "records",
+    "data", "ke", "liye", "ka", "ki", "bhi", "ab", "aur", "ok", "okay",
+}
+
+
+def _is_program_switch(question: str) -> bool:
+    """A short follow-up that only names ACE / ACI / both ("and ACI?", "both for?", "ACI ke liye")."""
+    if len(question.split()) > _CHOICE_REPLY_MAX_WORDS:
+        return False
+    words = [w for w in re.findall(r"[A-Za-z.]+", question) if w.lower().strip(".") not in _SWITCH_FILLERS]
+    return bool(words) and all(_program_choice(w) is not None for w in words)
+
+
+def _ask_program(pending: str, question: str, session_id: str, retry: bool) -> dict:
+    """Ask ACE or ACI (again, with a "sorry" when retry) and remember the waiting question."""
+    message = _program_choice_message(pending, question if retry else None)
+    save_turn(session_id, question, question, message, pending_question=pending)
+    return {"answer": message, "session_id": session_id}
+
+
+def _program_choice_message(pending: str, unclear_reply: str | None) -> str:
+    """The "ACE or ACI?" message, written by the LLM for this question; the fixed message if
+    the LLM fails or its reply does not ask for ACE and ACI."""
+    fallback = PROGRAM_CHOICE_RETRY_MESSAGE if unclear_reply else PROGRAM_CHOICE_MESSAGE
+    try:
+        message = llm_client.generate_text(
+            PROGRAM_CHOICE_SYSTEM_PROMPT, build_program_choice_prompt(pending, unclear_reply), max_tokens=400,
+        ).strip()
+    except Exception as exc:
+        log.warning("  ACE / ACI question: LLM failed (%s) -> fixed message", exc)
+        return fallback
+    if not message or len(message) > 400 or "ACE" not in message or "ACI" not in message:
+        log.warning("  ACE / ACI question: unusable LLM reply %r -> fixed message", message[:200])
+        return fallback
+    return message
+
+
+def _answer_for_both(original: str, turns: list[dict], company_id: int, session_id: str) -> dict:
+    """The waiting question answered for ACE (emanifest) first, then ACI (trips), in one reply."""
+    log.info("  Reply 'both' to the ACE / ACI question -> answering '%s' for every collection", original)
+    planner_history = format_history(turns, PLANNER_HISTORY_ANSWER_CHARS)
+    answer_history = format_history(turns, CHAT_HISTORY_ANSWER_CHARS)
+    parts = []
+    for spec in COLLECTIONS.values():  # emanifest (ACE) first, then trips (ACI)
+        question = f"{original} (for {spec.record_label}s)"
+        plan = plan_question(question, planner_history, company_id)
+        parts.append(f"**{spec.record_label}s**\n\n{_answer(question, plan, answer_history, company_id)}")
+    answer = "\n\n".join(parts)
+    combined = f"{original} (for ACE and ACI)"
+    save_turn(session_id, combined, combined, answer, program_question=original)
     return {"answer": answer, "session_id": session_id}
 
 

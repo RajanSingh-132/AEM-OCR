@@ -5,6 +5,9 @@ One document per session in CHAT_MEMORY_DB.CHAT_MEMORY_COLLECTION:
     company_id  owner; a session is only ever loaded for the same company
     created_at, updated_at
     turns       [{question, standalone_question, answer, at}, ...] (last CHAT_MAX_STORED_TURNS)
+                + pending_question on a turn that asked "ACE or ACI?" (the question still to answer)
+                + program_question on a turn that answered such a question for ACE / ACI / both
+                  (so "and ACI?" can ask it again for the other program)
 Sessions not used for CHAT_SESSION_TTL_DAYS are deleted by MongoDB (TTL index on updated_at).
 """
 
@@ -57,10 +60,19 @@ def start_session(session_id: str | None, company_id: int) -> tuple[str, list[di
     return new_id, []
 
 
-def save_turn(session_id: str, question: str, standalone_question: str, answer: str) -> None:
-    """Append one question/answer to the session. Never raises: memory must not break the chat."""
+def save_turn(session_id: str, question: str, standalone_question: str, answer: str,
+              pending_question: str | None = None, program_question: str | None = None) -> None:
+    """Append one question/answer to the session. Never raises: memory must not break the chat.
+
+    pending_question: set when the answer asked "ACE or ACI?"; the question waiting for that choice.
+    program_question: set when the answer was that question answered for ACE / ACI / both.
+    """
     now = datetime.now(timezone.utc)
     turn = {"question": question, "standalone_question": standalone_question, "answer": answer, "at": now}
+    if pending_question:
+        turn["pending_question"] = pending_question
+    if program_question:
+        turn["program_question"] = program_question
     try:
         _sessions().update_one(
             {"_id": session_id},

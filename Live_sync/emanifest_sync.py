@@ -16,8 +16,9 @@ Settings in .env:
 
 Rules for every record from the API (key = CompanyId + Id):
     1. Id not in MongoDB                              -> embed and store
-    2. Id in MongoDB, CreatedModifiedOnDate different -> delete the stored document(s), embed and store the new one
-    3. Id in MongoDB, CreatedModifiedOnDate the same  -> skip (no embedding, no write)
+    2. Id in MongoDB, CreatedModifiedOnDate OR Status different (e.g. Draft -> Ready, even when
+       CreatedModifiedOnDate did not change)          -> delete the stored document(s), embed and store the new one
+    3. Id in MongoDB, CreatedModifiedOnDate AND Status the same -> skip (no embedding, no write)
 
 The API returns records sorted by last change, newest first. A cycle reads page 1 and goes on to the
 next page as long as every record on the page was new or changed (there is no page limit, so a
@@ -81,6 +82,7 @@ EMANIFEST_ENDPOINT = "/api/EManifest/GetEManifestAll_ai"
 EMANIFEST_SEARCH_VALUE = os.getenv("EMANIFEST_SEARCH_VALUE", "").strip() or "Km9wdGlvbjF8"
 EMANIFEST_SORT_COLUMN = "lastUpdate"  # newest change first
 MODIFIED_FIELD = "CreatedModifiedOnDate"
+STATUS_FIELD = "Status"  # a status change (e.g. Draft -> Ready) re-stores the record too
 
 LOG_FILE = Path(__file__).resolve().parent / "logs" / "emanifest_sync.log"
 
@@ -155,11 +157,17 @@ def _modified(value) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _version(record: dict) -> tuple[str, str]:
+    """What decides "changed": (CreatedModifiedOnDate, Status)."""
+    return _modified(record.get(MODIFIED_FIELD)), _modified(record.get(STATUS_FIELD))
+
+
 def _stored_versions(collection, company_id: int, ids: list) -> dict:
-    """{Id: {CreatedModifiedOnDate of each stored document with that Id}} (one query)."""
+    """{Id: {(CreatedModifiedOnDate, Status) of each stored document with that Id}} (one query)."""
     stored: dict = defaultdict(set)
-    for doc in collection.find({"CompanyId": company_id, "Id": {"$in": ids}}, {"_id": 0, "Id": 1, MODIFIED_FIELD: 1}):
-        stored[doc["Id"]].add(_modified(doc.get(MODIFIED_FIELD)))
+    projection = {"_id": 0, "Id": 1, MODIFIED_FIELD: 1, STATUS_FIELD: 1}
+    for doc in collection.find({"CompanyId": company_id, "Id": {"$in": ids}}, projection):
+        stored[doc["Id"]].add(_version(doc))
     return stored
 
 
@@ -186,8 +194,12 @@ def _process_page(collection, company_id: int, records: list[dict], stats: SyncS
         versions = stored.get(fields["Id"])
         if versions is None:                                       # rule 1: new
             is_update[fields["Id"]] = False
-        elif versions != {_modified(fields.get(MODIFIED_FIELD))}:  # rule 2: changed
+        elif versions != {_version(fields)}:                       # rule 2: changed (date or Status)
             is_update[fields["Id"]] = True
+            old_status = {status for _, status in versions}
+            if old_status != {_modified(fields.get(STATUS_FIELD))}:
+                log.info("  eManifest Id %s: Status %s -> %s", fields["Id"],
+                         "/".join(sorted(old_status)) or "(empty)", _modified(fields.get(STATUS_FIELD)) or "(empty)")
         else:                                                      # rule 3: unchanged
             stats.unchanged += 1
             continue

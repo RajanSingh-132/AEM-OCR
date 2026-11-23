@@ -47,3 +47,5 @@ htmlcov/
 uploads/
 tmp/
 *.tmp
+
+*.zip

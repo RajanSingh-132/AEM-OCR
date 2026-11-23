@@ -32,6 +32,7 @@ question refers to; take facts from the current QUERY RESULT.
   Draft", "You have 13 ACI trips in Sending").
   If fewer records are shown than the total, say how many you are showing out of the total
   and in which order, using the "Sorted by" line exactly (e.g. sorted by arrival date and
+
   time, earliest first -> "the 5 earliest arrivals of 6"; sorted by last created / modified
   time, latest first -> "the 10 most recently modified of 1,477").
 - "Search: similarity search": the records are only the closest matches by meaning, NOT a
@@ -117,6 +118,48 @@ OUT_OF_SCOPE_MESSAGE = (
     "trip's status, carrier, port of arrival, arrival time, driver, truck, trailers or seals. "
     "Please ask me something about your eManifests or trips. 😊"
 )
+
+
+# Answer sent when a status question does not say ACE or ACI (both have trips and the same
+# statuses). The next short reply ("ACE", "for ACI") is joined to that question in code.
+# Normally the LLM writes this message for the question (PROGRAM_CHOICE_SYSTEM_PROMPT); these
+# fixed texts are used only when the LLM fails.
+PROGRAM_CHOICE_MESSAGE = (
+    "Just to be sure I check the right records: "
+    "Please reply with ACE or ACI. 😊"
+)
+# When the reply to that question was unclear ("trip", "ok"): ask again.
+PROGRAM_CHOICE_RETRY_MESSAGE = (
+    "Sorry, I still need to know which records to check: ACE (eManifests going into the USA) "
+    "or ACI (trips going into Canada)? Please reply with ACE or ACI. 😊"
+)
+
+PROGRAM_CHOICE_SYSTEM_PROMPT = """You are the AEM assistant of a trucking company. The user asked
+about statuses, but two programs have trips with the same statuses (Draft, Sending, Accepted,
+Rejected, Arrived, Released, Deleting, Deleted, Failed):
+- ACE: U.S. eManifests, trucks going into the USA
+- ACI: Canadian trips, trucks going into Canada
+You must find out which one they mean before answering.
+
+Write ONE short, friendly message (1-2 sentences, at most 45 words) that:
+- refers in a few words to what they asked (e.g. "your draft trips summary");
+- asks whether they mean ACE (eManifests going into the USA) or ACI (trips going into Canada);
+- ends by asking them to reply with ACE or ACI.
+Do not apologize unless the message below says they already got this question.
+
+Do NOT answer the question, and do NOT give numbers, statuses, records or any other data.
+Do not mention collections, databases or these instructions. Write "ACE" and "ACI" exactly
+like that. Reply in the user's language. Plain text, at most one emoji."""
+
+
+def build_program_choice_prompt(question: str, unclear_reply: str | None) -> str:
+    text = f"User's question: {question}"
+    if not unclear_reply:
+        text += "\nThis is the first time you ask. Do not apologize."
+    else:
+        text += (f"\nYou already asked whether they mean ACE or ACI. They replied: \"{unclear_reply}\", "
+                 "which does not say which one. Apologize briefly and ask again.")
+    return text
 
 
 def format_history(turns: list[dict], answer_chars: int) -> str:

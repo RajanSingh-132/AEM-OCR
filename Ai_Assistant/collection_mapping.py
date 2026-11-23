@@ -74,6 +74,9 @@ class CollectionSpec:
     program_aliases: tuple[str, ...] = ()
     direction_aliases: tuple[str, ...] = ()
     country_aliases: tuple[str, ...] = ()
+    # Statuses only this program has (ACE "Ready" / "Held", ACI "InChange"): checked after the
+    # strong aliases and before the weak ones, so "how many trips are ready?" -> emanifest.
+    status_aliases: tuple[str, ...] = ()
     # (code field, trip field): users often write both as one value, e.g. SCAC "19E5" + trip
     # number "TRPRPXG5S" = "19E5TRPRPXG5S" (see services/id_resolver.py).
     trip_key: tuple[str, str] | None = None
@@ -157,6 +160,9 @@ EMANIFEST = CollectionSpec(
     program_aliases=("ACE", "ACEs", "PAPS"),
     direction_aliases=_direction(_US_NAMES, _CANADA_NAMES),  # into the USA / from Canada
     country_aliases=_US_NAMES + ("American", "CBP"),
+    # ACE statuses: Draft, Ready, Sending, Accepted, Rejected, Deleting, Deleted, Arrived, Held,
+    # Released, Failed (+ Arrived with amending). Only these are not ACI statuses:
+    status_aliases=("Ready", "Held", "Amending", "Amended", "Amendment"),
     text_field="page_content",
     company_field="CompanyId",
     id_fields=("TripNum", "conveyanceNumber", "LpOne", "ShipmentControl", "ReferenceID"),
@@ -227,6 +233,9 @@ TRIPS = CollectionSpec(
     program_aliases=("ACI", "ACIs", "PARS"),
     direction_aliases=_direction(_CANADA_NAMES, _US_NAMES),  # into Canada / from the USA
     country_aliases=_CANADA_NAMES + ("Canadian", "CBSA"),
+    # ACI statuses: Draft, Sending, Accepted, Rejected, Arrived, Released, Deleting, Deleted,
+    # InChange, Failed. Only this one is not an ACE status:
+    status_aliases=("InChange", "In-Change"),
     text_field="page_content",
     company_field="CompanyId",
     id_fields=("TripNo", "TruckNo", "TruckPlate"),
@@ -287,9 +296,37 @@ def _patterns(attr: str) -> list[tuple[str, str, re.Pattern]]:
     return [(alias, name, _alias_pattern(alias)) for alias, name in sorted(pairs, key=lambda p: -len(p[0]))]
 
 
-# Program words (three levels), then strong aliases of every collection, then weak aliases.
+# Program words (three levels), then strong aliases, then program-only statuses, then weak aliases.
 _PROGRAM_LEVELS = [_patterns("program_aliases"), _patterns("direction_aliases"), _patterns("country_aliases")]
-_ALIAS_PATTERNS = _patterns("aliases") + _patterns("weak_aliases")
+_STRONG_PATTERNS = _patterns("aliases")
+_STATUS_PATTERNS = _patterns("status_aliases")
+_WEAK_PATTERNS = _patterns("weak_aliases")
+
+
+def _single_side(question: str, patterns) -> tuple[CollectionSpec, str] | None:
+    """(collection, alias) when the patterns that match all point to ONE collection, else None."""
+    hits = {}
+    for alias, name, pattern in patterns:
+        if name not in hits and pattern.search(question):
+            hits[name] = alias
+    if len(hits) == 1:
+        name, alias = next(iter(hits.items()))
+        return COLLECTIONS[name], alias
+    return None
+
+
+def named_programs(question: str) -> set[str]:
+    """Collections whose program names (ACE / PAPS, ACI / PARS) appear in the question."""
+    return {name for _, name, pattern in _PROGRAM_LEVELS[0] if pattern.search(question)}
+
+
+def match_program(question: str) -> tuple[CollectionSpec, str] | None:
+    """(collection, word) when the question names ACE or ACI (program, direction or country words)."""
+    for level in _PROGRAM_LEVELS:
+        hit = _single_side(question, level)
+        if hit:
+            return hit
+    return None
 
 
 def match_by_keywords(question: str) -> tuple[CollectionSpec, str] | None:
@@ -297,18 +334,91 @@ def match_by_keywords(question: str) -> tuple[CollectionSpec, str] | None:
 
     Priority: program words in three levels (program name, direction, country / agency; see
     the module docstring), then strong aliases ("ACI trip", "emanifest", "manifest", ...),
-    then weak aliases ("trip", ...). A level whose words point to both collections ("ACE and
-    ACI") does not decide; the next level does.
+    then statuses only one program has ("Ready", "Held" / "InChange"), then weak aliases
+    ("trip", ...). A level whose words point to both collections ("ACE and ACI") does not
+    decide; the next level does.
     """
-    for level in _PROGRAM_LEVELS:
-        hits = {}
-        for alias, name, pattern in level:
-            if name not in hits and pattern.search(question):
-                hits[name] = alias
-        if len(hits) == 1:
-            name, alias = next(iter(hits.items()))
+    hit = match_program(question)
+    if hit:
+        return hit
+    for alias, name, pattern in _STRONG_PATTERNS:
+        if pattern.search(question):
             return COLLECTIONS[name], alias
-    for alias, name, pattern in _ALIAS_PATTERNS:
+    hit = _single_side(question, _STATUS_PATTERNS)
+    if hit:
+        return hit
+    for alias, name, pattern in _WEAK_PATTERNS:
         if pattern.search(question):
             return COLLECTIONS[name], alias
     return None
+
+
+# ---------- status questions that could be ACE or ACI ----------
+# Words of a status question; the statuses here exist in BOTH programs (ACE-only / ACI-only
+# statuses are status_aliases above and decide on their own).
+_STATUS_QUESTION = re.compile(
+    r"(?<![A-Za-z0-9])(status|statuses|status-?wise|draft|drafts|sending|accepted|rejected|"
+    r"deleting|deleteing|deleted|arrived|released|failed)(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_WEAK_WORDS = {alias for alias, _, _ in _WEAK_PATTERNS}
+
+# Misspelled status words ("dratf", "rejcted", "arived", "stauts") count too: one letter wrong,
+# missing, extra, or two letters swapped. Statuses of one program only ("ready", "held") are
+# left out: "read", "head", "hold" are one letter away. Real words one letter away from a
+# status are not statuses ("trips that arrive tomorrow").
+_FUZZY_STATUS_WORDS = ("status", "draft", "sending", "accepted", "rejected", "deleting",
+                       "deleted", "arrived", "released", "failed")
+_NOT_STATUS_WORDS = {"arrive", "arrives", "release", "releases", "delete", "deletes", "deleter"}
+
+
+def _one_edit_apart(a: str, b: str) -> bool:
+    """True when a and b differ by one letter changed / added / removed, or two neighbours swapped."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return a == b
+    if len(a) == len(b):
+        diff = [i for i in range(len(a)) if a[i] != b[i]]
+        return len(diff) == 1 or (len(diff) == 2 and diff[1] == diff[0] + 1
+                                  and a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]])
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
+def _is_status_question(question: str) -> bool:
+    if _STATUS_QUESTION.search(question):
+        return True
+    for word in re.findall(r"[A-Za-z]{4,}", question.lower()):
+        if word in _NOT_STATUS_WORDS:
+            continue
+        if any(_one_edit_apart(word, status) for status in _FUZZY_STATUS_WORDS):
+            return True
+    return False
+
+
+def _has_identifier(question: str) -> bool:
+    # A trip number / plate / SCAC+trip value: letters and digits mixed ("TRP562334",
+    # "19E5TRPRPXG5S") or 5+ digits ("45444"). Dates ("2026-11-20") and counts ("top 5") are not.
+    for token in re.findall(r"[A-Za-z0-9]+", question):
+        has_digit = any(c.isdigit() for c in token)
+        if has_digit and (len(token) >= 5 or any(c.isalpha() for c in token)):
+            return True
+    return False
+
+
+def needs_program_choice(question: str) -> bool:
+    """True for a status question that does not say ACE or ACI ("draft trips status wise
+    summary", "status summary"): both programs have trips and the same statuses, so the
+    assistant asks which one instead of guessing. Questions with an identifier ("status of
+    trip 45444") keep the normal flow: the ID is looked up in both collections.
+    """
+    if not _is_status_question(question) or _has_identifier(question):
+        return False
+    return clear_collection(question) is None
+
+
+def clear_collection(question: str) -> CollectionSpec | None:
+    """The collection when the question says it clearly (ACE / ACI words, "eManifest",
+    "manifest", ACE-only or ACI-only statuses); None for nothing or only "trip" words, which
+    both programs use."""
+    hit = match_by_keywords(question)
+    return hit[0] if hit and hit[1] not in _WEAK_WORDS else None
